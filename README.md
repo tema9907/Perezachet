@@ -1,13 +1,13 @@
 # Экспертное заключение — генератор
 
-Веб-приложение и CLI для автоматического заполнения таблицы «Экспертного заключения» по результатам неформального обучения. На входе — PDF с заявлением студента и сертификатами курсов (Coursera, Simplilearn, Codio, Google, ИНТУИТ, Stepik и т.п.), на выходе — `.docx` с готовой таблицей.
+Веб-приложение для автоматического заполнения «Экспертного заключения» по результатам неформального обучения. На входе — PDF с заявлением студента и сертификатами курсов, на выходе — `.docx` с готовой таблицей.
 
 ## Как это работает
 
 ```
 ┌──────────────┐   ┌──────────────────┐   ┌──────────────────────┐   ┌──────────────┐
 │  PDF файл    │──▶│ PyMuPDF: страница│──▶│ Vision LLM           │──▶│ Редактор UI  │
-│ (заявление + │   │   → PNG (150 DPI)│   │ OpenRouter (4 модели)│   │ или CLI →    │
+│ (заявление + │   │   → PNG (150 DPI)│   │ OpenRouter (4 модели)│   │ или очередь→ │
 │  сертификаты)│   └──────────────────┘   │ ↓ failover           │   │ docx         │
 └──────────────┘                          │ Gemini (резерв)      │   └──────────────┘
                                           └──────────────────────┘
@@ -15,9 +15,9 @@
 
 - **Заявление (стр. 1)** — рукописное, vision-модель распознаёт ФИО, группу, курс, телефон, список дисциплин и дату.
 - **Сертификаты (стр. 2+)** — даже если повернуты на 90°, модель извлекает название курса, провайдера, часы, оценку и дату.
-- **Cross-validation** — печатное ФИО из сертификатов используется для коррекции рукописного из заявления.
-- **Авто-сопоставление** — LLM подсказывает какой сертификат к какой дисциплине относится.
-- **Failover** — если OpenRouter упёрся в дневной лимит модели, пробуем следующую (4 модели подряд), потом откатываемся на Gemini.
+- **Cross-validation** — ФИО из сертификатов используется для коррекции рукописного из заявления.
+- **Авто-сопоставление** — LLM подсказывает, какой сертификат к какой дисциплине относится.
+- **Failover** — если OpenRouter упёрся в дневной лимит модели, пробуется следующая (4 модели подряд), затем Gemini.
 
 ## Стек
 
@@ -25,70 +25,99 @@
 - **PDF → картинки:** PyMuPDF
 - **Vision-провайдеры:** OpenRouter (несколько `:free` моделей) + Google Gemini как резерв
 - **Генерация DOCX:** python-docx
+- **Google Drive:** google-api-python-client (service account + OAuth)
+- **Очередь:** SQLite (`queue_store.py`)
 - **Frontend:** vanilla HTML/CSS/JS
 
 ## Установка
 
 ```bash
-cd /home/nikon/Proj/ddd
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+python -m venv .venv
+.venv/Scripts/pip install -r requirements.txt   # Windows
+# .venv/bin/pip install -r requirements.txt     # Linux/Mac
 ```
 
 ## Настройка ключей
 
-Рекомендуется **OpenRouter** — даёт доступ к 4 бесплатным vision-моделям с авто-фейловером, итого ~50–100 запросов в день суммарно:
+### LLM-провайдеры (обязательно хотя бы один)
 
-1. Зайти на <https://openrouter.ai/keys> (вход через Google/GitHub)
-2. Нажать **«Create Key»** → название любое
-3. Скопировать `sk-or-v1-...`
+**OpenRouter** — даёт доступ к 4 бесплатным vision-моделям с авто-фейловером:
+1. Зайти на https://openrouter.ai/keys (вход через Google/GitHub)
+2. **«Create Key»** → скопировать `sk-or-v1-...`
 
-Опционально **Gemini** как резерв:
-1. <https://aistudio.google.com/apikey>
-2. **«Create API key»**
-3. Скопировать `AIza...`
+**Gemini** (резерв):
+1. https://aistudio.google.com/apikey → **«Create API key»**
+2. Скопировать `AIza...`
 
-Записать в `.env` файл в корне проекта:
+### Google Drive (опционально)
+
+Для автоматического опроса папки входящих PDF и загрузки готовых DOCX.
+
+**Service account (для чтения PDF):**
+1. Google Cloud Console → IAM → Сервисные аккаунты → создать
+2. Выдать роль «Редактор» на входную папку Drive
+3. Скачать JSON ключ → сохранить в `secrets/`
+
+**OAuth (для загрузки DOCX в «Мой диск»):**
+```bash
+python drive_oauth_setup.py   # открывает браузер, сохраняет токен
+```
+
+### Файл `.env`
 
 ```dotenv
 OPENROUTER_API_KEY=sk-or-v1-...
-GEMINI_API_KEY=AIza...        # необязательно
+GEMINI_API_KEY=AIza...                    # необязательно
+
+# Google Drive (необязательно)
+DRIVE_ENABLED=true
+DRIVE_SERVICE_ACCOUNT_JSON=secrets/sa.json
+DRIVE_INPUT_FOLDER_ID=<ID входной папки>
+DRIVE_OUTPUT_FOLDER_ID=<ID выходной папки>
+DRIVE_INTAKE_FOLDER_ID=<ID папки заявлений студентов>
+DRIVE_POLL_INTERVAL=60                    # секунды между опросами
+DRIVE_UPLOAD_AUTH=service_account         # или oauth
 ```
 
-Либо в переменные окружения:
-
-```bash
-export OPENROUTER_API_KEY="sk-or-v1-..."
-export GEMINI_API_KEY="AIza..."
-```
-
-Либо ввести в полях UI — они сохранятся в `localStorage` браузера.
+API-ключи LLM можно также ввести прямо в UI — они сохраняются в `localStorage` браузера.
 
 ## Запуск
 
-### Веб-приложение
-
 ```bash
-./run.sh
-# или
-.venv/bin/python -m uvicorn app:app --port 8765
+.venv/Scripts/python -m uvicorn app:app --port 8765   # Windows
+# .venv/bin/python -m uvicorn app:app --port 8765     # Linux/Mac
 ```
 
-Открыть <http://127.0.0.1:8765>. Workflow:
+## Страницы и workflow
 
-1. **Шаг 1.** Перетащить PDF в дропзону, нажать «Распознать». 30–90 секунд.
-2. **Шаг 2.** Проверить и поправить распознанные поля: ФИО, группа, ОП, курс. Код ОП (например `6B06105`) подставляется автоматически по префиксу группы (АПО, ИС, ВТ, ИКТ).
-3. **Сертификаты** — карточки с распознанными курсами. Можно:
-   - редактировать поля прямо в карточке (название, провайдер, часы);
-   - перетаскивать в нужную дисциплину (drag-and-drop) или жать «→ дисциплина».
-4. **Дисциплины** — для каждой задать кредиты, часы (или авто-сумма), баллы, соответствие, примечание, итоговую оценку.
-5. **«Сгенерировать DOCX»** — скачивается как `ЭЗ_<ФИО>.docx`.
+### `/` — Ручной анализ PDF
 
-### CLI (без браузера)
+1. Перетащить PDF в дропзону → «Распознать» (30–90 с)
+2. Проверить ФИО, группу, код ОП, курс
+3. Перетащить сертификаты в нужные дисциплины (drag-and-drop)
+4. Задать кредиты, часы, баллы, соответствие, итоговую оценку
+5. «Сгенерировать DOCX» → скачивается `ЭЗ_<ФИО>.docx`
+
+### `/intake` — Форма заявления (для студентов)
+
+Студент заполняет заявление онлайн: ФИО, группа, факультет, список дисциплин и сертификаты. Результат:
+- Скачивается `Заявление_<ФИО>.docx` для подписи
+- Объединённый PDF (заявление + сертификаты) автоматически загружается в Drive-папку заявлений (`DRIVE_INTAKE_FOLDER_ID`)
+
+### `/approve` — Очередь и утверждение (для экспертов)
+
+Если включён Drive-воркер (`DRIVE_ENABLED=true`), приложение само опрашивает входную папку. При появлении нового PDF:
+1. Автоматически распознаёт и добавляет в очередь (статус `pending_approval`)
+2. Эксперт открывает `/approve`, редактирует результаты при необходимости
+3. Нажимает «Утвердить» → DOCX генерируется и загружается в выходную папку Drive (статус `sent`)
+
+Статусы очереди: `pending_approval` → `approved` → `sent` / `error`
+
+## CLI (без браузера)
 
 ```bash
 # один файл → ЭЗ_<имя>.docx в текущей папке
-.venv/bin/python cli.py "/path/to/Сычёв В.А.pdf"
+.venv/bin/python cli.py "Сычёв В.А.pdf"
 
 # с явным именем выходного файла
 .venv/bin/python cli.py student.pdf -o report.docx
@@ -96,35 +125,41 @@ export GEMINI_API_KEY="AIza..."
 # несколько PDF разом в указанную папку
 .venv/bin/python cli.py *.pdf -O ~/reports/
 
-# без LLM-сопоставления курс→дисциплина (экономит запросы)
+# без LLM-сопоставления (экономит запросы)
 .venv/bin/python cli.py student.pdf --no-mapping
 
-# дополнительно сохранить распознанные данные .json для отладки
+# сохранить распознанные данные в .json для отладки
 .venv/bin/python cli.py student.pdf --json
-```
-
-Удобный алиас:
-
-```bash
-echo 'alias ez="cd /home/nikon/Proj/ddd && .venv/bin/python cli.py"' >> ~/.bashrc
-source ~/.bashrc
-ez "Сычёв В.А.pdf"
 ```
 
 ## Структура проекта
 
 ```
-ddd/
-├── app.py                # FastAPI: /api/analyze, /api/generate, /api/health
-├── analyzer.py           # PDF → vision-провайдеры (OpenRouter + Gemini) → JSON
-├── doc_generator.py      # python-docx → готовая таблица
-├── cli.py                # CLI для batch-обработки
-├── run.sh                # Однострочный запуск веб-приложения
+NefrLearn/
+├── app.py                   # FastAPI: все эндпоинты + Drive-воркер
+├── analyzer.py              # PDF → vision-провайдеры → JSON
+├── doc_generator.py         # python-docx → таблица экспертного заключения
+├── application_generator.py # python-docx/PDF → бланк заявления студента
+├── drive_client.py          # Google Drive API (SA + OAuth): read/upload
+├── drive_oauth.py           # OAuth credentials helpers
+├── drive_oauth_setup.py     # Одноразовая авторизация OAuth через браузер
+├── queue_store.py           # SQLite-очередь заявлений
+├── discipline_db.py         # База дисциплин: кредиты, часы, сопоставление
+├── discipline_db.json       # Данные дисциплин
+├── cert_verifier.py         # Верификация сертификатов по URL провайдеров
+├── syslog.py                # Логирование
+├── cli.py                   # CLI для batch-обработки
+├── run.sh                   # Однострочный запуск
 ├── requirements.txt
-├── .env                  # API ключи (в gitignore)
-├── static/{index.html,app.js,style.css}
-├── test_analyzer.py      # CLI отладка: показывает распознанное
-└── debug_analyzer.py     # CLI отладка: сырой ответ vision-модели
+├── .env                     # API ключи и Drive-конфиг (в .gitignore)
+├── secrets/                 # JSON ключи SA и OAuth-токен (в .gitignore)
+├── .data/queue.sqlite3      # SQLite файл очереди (создаётся автоматически)
+└── static/
+    ├── index.html           # Ручной анализ PDF
+    ├── approve.html         # Очередь и утверждение
+    ├── intake.html          # Форма заявления студента
+    ├── app.js
+    └── style.css
 ```
 
 ## Переменные окружения
@@ -134,11 +169,19 @@ ddd/
 | `OPENROUTER_API_KEY` | — | Ключ OpenRouter (рекомендуется) |
 | `GEMINI_API_KEY` | — | Ключ Gemini (резерв) |
 | `PROVIDERS` | `openrouter,gemini` | Порядок попыток провайдеров |
-| `OPENROUTER_MODELS` | 4 модели (см. ниже) | Список моделей OpenRouter через запятую, в порядке попыток |
+| `OPENROUTER_MODELS` | 4 модели | Список моделей OpenRouter через запятую |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Модель Gemini |
 | `RENDER_DPI` | `150` | DPI рендера страниц PDF |
 | `ANALYZER_WORKERS` | `2` | Параллельных запросов к API |
 | `ANALYZER_RETRIES` | `2` | Повторных попыток при transient ошибках |
+| `DRIVE_ENABLED` | — | `true` для включения Drive-воркера |
+| `DRIVE_SERVICE_ACCOUNT_JSON` | — | Путь к JSON ключу сервисного аккаунта |
+| `DRIVE_INPUT_FOLDER_ID` | — | ID Drive-папки с входящими PDF |
+| `DRIVE_OUTPUT_FOLDER_ID` | — | ID Drive-папки для выходных DOCX |
+| `DRIVE_INTAKE_FOLDER_ID` | — | ID Drive-папки для заявлений из `/intake` |
+| `DRIVE_POLL_INTERVAL` | `60` | Интервал опроса входной папки (секунды) |
+| `DRIVE_UPLOAD_AUTH` | `service_account` | Режим загрузки: `service_account` или `oauth` |
+| `DRIVE_OAUTH_TOKEN_JSON` | `secrets/drive-oauth-token.json` | Путь к OAuth-токену |
 
 **Дефолтный список моделей OpenRouter:**
 ```
@@ -148,18 +191,26 @@ meta-llama/llama-3.2-90b-vision-instruct:free
 mistralai/pixtral-12b:free
 ```
 
-Когда дневной лимит на одной модели заканчивается — автоматически пробуется следующая.
+## API эндпоинты
 
-## Endpoints
-
-- `GET  /` — UI
-- `GET  /api/health` — статус, какие провайдеры готовы, какие ключи подхвачены
-- `POST /api/analyze` — multipart с полями `pdf` (файл), опц. `openrouter_api_key`, `gemini_api_key`, `auto_map`
-- `POST /api/generate` — JSON с распознанными данными → docx файл
+| Метод | Путь | Описание |
+|---|---|---|
+| `GET` | `/` | Ручной анализ PDF |
+| `GET` | `/intake` | Форма заявления студента |
+| `GET` | `/approve` | Очередь и утверждение |
+| `GET` | `/api/health` | Статус: провайдеры, Drive, очередь |
+| `POST` | `/api/analyze` | PDF → JSON (multipart: `pdf`, `gemini_api_key`, `openrouter_api_key`, `auto_map`) |
+| `POST` | `/api/generate` | JSON → DOCX (экспертное заключение) |
+| `POST` | `/api/intake/generate` | Данные формы + файлы → DOCX заявления + PDF в Drive |
+| `GET` | `/api/requests` | Список очереди |
+| `GET` | `/api/requests/{id}` | Карточка заявления |
+| `POST` | `/api/requests/{id}/edit` | Сохранить черновик редактирования |
+| `POST` | `/api/requests/{id}/approve` | Утвердить → сгенерировать DOCX → загрузить в Drive |
+| `POST` | `/api/requests/{id}/reanalyze` | Повторно распознать PDF с Drive |
 
 ## Примечания
 
-- Таблица в DOCX содержит 12 колонок (как в образце), форматирование намеренно упрощено — Word/LibreOffice откроют без проблем.
-- Если префикс группы не в `PROGRAM_MAP` внутри `doc_generator.py`, поле ОП можно ввести вручную.
-- Соответствие по умолчанию — `«полное»`, можно менять.
-- `.env` в `.gitignore` — ключи в репозиторий не утекут.
+- Таблица в DOCX: 12 колонок, A4 landscape, Times New Roman 12pt — совместима с Word 2007+.
+- Если префикс группы не в `PROGRAM_MAP` (`doc_generator.py`), код ОП можно ввести вручную.
+- Сервисный аккаунт не имеет квоты Google Drive — для загрузки DOCX в «Мой диск» используйте `DRIVE_UPLOAD_AUTH=oauth`.
+- `.env` и `secrets/` в `.gitignore` — ключи в репозиторий не утекут.
