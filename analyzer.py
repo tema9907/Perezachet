@@ -79,6 +79,7 @@ class Certificate:
     date: str = ""
     student_name: str = ""
     certificate_id: str = ""
+    verify_url: str = ""   # URL верификации для дополнительного получения часов
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -91,6 +92,7 @@ class Application:
     disciplines: list[str] = field(default_factory=list)
     application_date: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
+    plan_data: dict[str, dict] = field(default_factory=dict)  # discipline → {credits,lec,prac,lab}
 
 
 @dataclass
@@ -142,11 +144,13 @@ CERTIFICATE_PROMPT = """На изображении — сертификат о 
   "grade": "оценка/балл если есть, например '92%', '88.09%', '4.4'. Если нет — пустая строка.",
   "date": "дата выдачи или период обучения как написано",
   "student_name": "ФИО владельца сертификата",
-  "certificate_id": "номер/ID сертификата если указан"
+  "certificate_id": "номер/ID сертификата если указан",
+  "verify_url": "URL для проверки подлинности сертификата если виден на изображении, например 'https://www.coursera.org/account/accomplishments/verify/XXXX' или 'https://stepik.org/cert/123'. Иначе пустая строка."
 }
 
 Правила:
 - Если на странице несколько визуальных блоков (например слева скриншот Coursera-страницы курса, а справа сам сертификат) — извлекай данные из обоих и склеивай: название курса бери одинаковое, часы из скриншота описания курса, провайдер по логотипу (Simplilearn/Codio/Google/...).
+- verify_url: ищи ссылки вида 'https://coursera.org/verify/...', 'https://stepik.org/cert/...', 'ude.my/...', 'credential.net/...' и т.п. — они обычно расположены внизу сертификата.
 - Если название содержит "Композиционное моделирование вычислительных систем", обязательно исправь на "Компьютерное моделирование вычислительных систем".
 - is_certificate=false ТОЛЬКО если изображение явно не сертификат.
 - Никаких комментариев и markdown — только JSON."""
@@ -523,6 +527,38 @@ def _call_with_failover(
 
 
 # ---------------------------------------------------------------------------
+# 'Приложение к заявлению' page parser
+# ---------------------------------------------------------------------------
+_RE_ANALYSIS_DISC = re.compile(r"^\d+\.\s+(.+?)(?:\s+(?:полное|частичное|нет\s+данных))?\s*$")
+_RE_ANALYSIS_HOURS = re.compile(
+    r"Кредитов:\s*(\d+).*?Лекции:\s*(\d+)\s*ч.*?Практики:\s*(\d+)\s*ч.*?Лаборат\.?:\s*(\d+)\s*ч"
+)
+
+
+def _parse_analysis_page(text: str) -> dict[str, dict]:
+    """Extract per-discipline plan data from the 'Приложение к заявлению' page."""
+    plan_data: dict[str, dict] = {}
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    current_disc: str | None = None
+    for line in lines:
+        dm = _RE_ANALYSIS_DISC.match(line)
+        if dm:
+            current_disc = dm.group(1).strip()
+            continue
+        if current_disc:
+            hm = _RE_ANALYSIS_HOURS.search(line)
+            if hm:
+                plan_data[current_disc] = {
+                    "credits": int(hm.group(1)),
+                    "lec": int(hm.group(2)),
+                    "prac": int(hm.group(3)),
+                    "lab": int(hm.group(4)),
+                }
+                current_disc = None
+    return plan_data
+
+
+# ---------------------------------------------------------------------------
 # PDF rendering
 # ---------------------------------------------------------------------------
 def render_pdf_pages(pdf_bytes: bytes, dpi: int = RENDER_DPI) -> list[bytes]:
@@ -575,6 +611,44 @@ def analyze_pdf(
     if not pages:
         return AnalysisResult(Application(), [])
 
+    # Extract hyperlinks from each PDF page (before rendering to images)
+    import cert_verifier as _cv
+    pdf_links_by_page: dict[int, list[str]] = {}
+    try:
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as _lnk_doc:
+            for _pi in range(_lnk_doc.page_count):
+                _page = _lnk_doc[_pi]
+                _links: list[str] = []
+                for _lnk in _page.get_links():
+                    _uri = _lnk.get("uri", "")
+                    if _uri and _uri.startswith("http"):
+                        _links.append(_uri)
+                # Also scan text for certificate URLs
+                _links.extend(_cv.extract_cert_urls(_page.get_text()))
+                if _links:
+                    # deduplicate
+                    seen_l: set[str] = set()
+                    pdf_links_by_page[_pi + 1] = [
+                        u for u in _links if u not in seen_l and not seen_l.add(u)  # type: ignore[func-returns-value]
+                    ]
+    except Exception as _e:
+        log.warning("Could not extract PDF links: %s", _e)
+
+    # Detect 'Приложение к заявлению' page (page 2 in combined PDFs from intake)
+    plan_data: dict[str, dict] = {}
+    cert_page_start = 1  # index into `pages` where certificates start
+    if len(pages) >= 2:
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as _check_doc:
+            if _check_doc.page_count >= 2:
+                page2_text = _check_doc[1].get_text()
+                if ("Приложение к заявлению" in page2_text
+                        or "Анализ соответствия" in page2_text):
+                    plan_data = _parse_analysis_page(page2_text)
+                    cert_page_start = 2  # skip the analysis page for cert processing
+                    log.info(
+                        "detected analysis page, extracted %d plan entries", len(plan_data)
+                    )
+
     errors: list[str] = []
     log.info("analyzing PDF: %d pages, dpi=%d, workers=%d",
              len(pages), RENDER_DPI, MAX_WORKERS)
@@ -594,7 +668,7 @@ def analyze_pdf(
                 require_nonempty=("course_title",),
                 label=f"cert-page-{idx}",
             ): idx
-            for idx, page_bytes in enumerate(pages[1:], start=2)
+            for idx, page_bytes in enumerate(pages[cert_page_start:], start=cert_page_start + 1)
         }
         all_futures = {app_future: 1, **cert_futures}
         results: dict[int, dict[str, Any] | None] = {}
@@ -628,6 +702,19 @@ def analyze_pdf(
                 continue
             if data.get("is_certificate") is False:
                 continue
+            # Merge verify_url from LLM result and PDF hyperlinks
+            llm_url = str(data.get("verify_url", "")).strip()
+            page_urls = pdf_links_by_page.get(idx, [])
+            # Pick best URL: prefer known cert providers
+            all_candidate_urls = ([llm_url] if llm_url else []) + page_urls
+            verify_url = ""
+            for _u in all_candidate_urls:
+                if _cv.extract_cert_urls(_u):  # matches a known pattern
+                    verify_url = _u
+                    break
+            if not verify_url and all_candidate_urls:
+                verify_url = all_candidate_urls[0]
+
             cert = Certificate(
                 page=idx,
                 course_title=str(data.get("course_title", "")).strip(),
@@ -637,6 +724,7 @@ def analyze_pdf(
                 date=str(data.get("date", "")).strip(),
                 student_name=str(data.get("student_name", "")).strip(),
                 certificate_id=str(data.get("certificate_id", "")).strip(),
+                verify_url=verify_url,
                 raw=data,
             )
             certs.append(cert)
@@ -644,6 +732,38 @@ def analyze_pdf(
                 errors.append(
                     f"Сертификат на стр. {idx}: не удалось распознать название курса"
                 )
+
+    # ---------------------------------------------------------------------------
+    # Enrich hours via certificate verification URLs (for certs with missing hours)
+    # ---------------------------------------------------------------------------
+    def _needs_hours(h: str) -> bool:
+        return not h or h in ("", "—", "0", "0 ч", "0 часов")
+
+    for cert in certs:
+        if not _needs_hours(cert.hours):
+            continue  # already has hours from image
+        urls_to_try = []
+        if cert.verify_url:
+            urls_to_try.append(cert.verify_url)
+        # Also try URLs from the PDF page that weren't captured yet
+        for u in pdf_links_by_page.get(cert.page, []):
+            if u not in urls_to_try:
+                urls_to_try.append(u)
+
+        for url in urls_to_try[:3]:  # max 3 URLs per cert
+            try:
+                info = _cv.fetch_cert_info(url)
+                if info.get("hours") and float(info["hours"]) > 0:
+                    cert.hours = f"{int(float(info['hours']))} ч"
+                    if not cert.verify_url:
+                        cert.verify_url = url
+                    log.info("cert page %d: hours from URL → %s", cert.page, cert.hours)
+                    # Update course title if not extracted from image
+                    if not cert.course_title and info.get("course_title"):
+                        cert.course_title = info["course_title"]
+                    break
+            except Exception as _url_err:
+                log.warning("cert URL enrich failed (%s): %s", url[:60], _url_err)
 
     application = Application(
         student_name=str(app_data.get("student_name", "")).strip(),
@@ -655,16 +775,26 @@ def analyze_pdf(
             d.strip() for d in app_data.get("disciplines", []) if str(d).strip()
         ],
         raw=app_data,
+        plan_data=plan_data,
     )
 
+    # ФИО из заявления имеет приоритет.
+    # Из сертификатов берём только если заявление вернуло пустое/некорректное имя.
+    app_name = _normalize_name(application.student_name)
     cert_name = _consensus_name([c.student_name for c in certs])
-    if cert_name:
+
+    def _looks_valid(name: str) -> bool:
+        """Имя считается корректным если содержит хотя бы 2 слова из кириллицы/латиницы."""
+        words = [w for w in name.split() if len(w) >= 2]
+        return len(words) >= 2
+
+    if _looks_valid(app_name):
+        log.info("ФИО из заявления: %s", app_name)
+    elif cert_name and _looks_valid(cert_name):
         application.student_name = cert_name
-        log.info(f"ФИО студента распознано из сертификатов: {application.student_name}")
-        print(f"ФИО студента распознано из сертификатов: {application.student_name}")
-    else:
+        log.info("ФИО из заявления отсутствует/некорректно (%r) — берём из сертификатов: %s", app_name, cert_name)
+    elif not app_name and not cert_name:
         log.warning("ФИО студента не удалось распознать ни из заявления, ни из сертификатов.")
-        print("ФИО студента не удалось распознать ни из заявления, ни из сертификатов.")
 
     return AnalysisResult(application=application, certificates=certs, errors=errors)
 
@@ -752,17 +882,23 @@ def _tokens(text: str) -> set[str]:
 def _local_keyword_mapping(
     disciplines: list[str], certificates: list[Certificate],
 ) -> dict[int, int]:
-    """Сопоставляет cert→disc по ключевым словам + тематическим группам.
-
-    Возвращает {cert_index: disc_index | -1}. Каждый сертификат
-    привязывается к лучшей дисциплине; в одну дисциплину может попасть
-    несколько сертификатов.
-    """
+    """Сопоставляет cert→disc по ключевым словам + тематическим группам + базе дисциплин."""
     if not disciplines or not certificates:
         return {i: -1 for i in range(len(certificates))}
 
     disc_tokens = [_tokens(d) for d in disciplines]
     disc_topics = [_topic_of(d) for d in disciplines]
+
+    # Try fuzzy lookup in discipline DB to get canonical token sets
+    try:
+        import discipline_db as _ddb
+        disc_db_tokens: list[set[str]] = []
+        for d in disciplines:
+            info = _ddb.fuzzy_lookup(d)
+            disc_db_tokens.append(_tokens(info.name) if info else set())
+    except Exception:
+        disc_db_tokens = [set() for _ in disciplines]
+
     mapping: dict[int, int] = {}
     for ci, cert in enumerate(certificates):
         cert_text = f"{cert.course_title} {cert.provider}"
@@ -772,13 +908,13 @@ def _local_keyword_mapping(
         best_di = -1
         for di, _disc in enumerate(disciplines):
             overlap = len(c_tokens & disc_tokens[di])
-            score = overlap * 2
+            db_overlap = len(c_tokens & disc_db_tokens[di]) if disc_db_tokens[di] else 0
+            score = max(overlap, db_overlap) * 2
             if c_topic and disc_topics[di] and c_topic == disc_topics[di]:
                 score += 5
             if score > best_score:
                 best_score = score
                 best_di = di
-        # минимальный порог: либо общая тема, либо хотя бы одно общее слово
         mapping[ci] = best_di if best_score >= 2 else -1
     return mapping
 
@@ -802,15 +938,29 @@ def suggest_mapping(
         log.info("mapping: no providers, using local keyword mapping")
         return _local_keyword_mapping(disciplines, result.certificates)
 
+    # Enrich disciplines with plan data (hours/credits) for better LLM matching
+    try:
+        import discipline_db as _ddb
+        disc_extra = {}
+        for i, d in enumerate(disciplines):
+            info = _ddb.fuzzy_lookup(d)
+            if info:
+                disc_extra[i] = f"{info.credits} кред., {info.contact_hours} ч. ауд."
+    except Exception:
+        disc_extra = {}
+
     cert_lines = [
         f"  {i}: \"{c.course_title}\" — {c.provider} ({c.hours})"
         for i, c in enumerate(result.certificates)
     ]
-    disc_lines = [f"  {i}: {d}" for i, d in enumerate(disciplines)]
+    disc_lines = [
+        f"  {i}: {d}" + (f" [{disc_extra[i]}]" if i in disc_extra else "")
+        for i, d in enumerate(disciplines)
+    ]
     prompt = (
         "У студента список дисциплин учебного плана и список пройденных онлайн-курсов "
         "(сертификатов). Сопоставь каждый сертификат с одной подходящей дисциплиной "
-        "по смыслу. Один сертификат — одна дисциплина. Если ни одна не подходит — -1.\n\n"
+        "по смыслу названия курса. Один сертификат — одна дисциплина. Если ни одна не подходит — -1.\n\n"
         f"Дисциплины:\n{chr(10).join(disc_lines)}\n\n"
         f"Сертификаты:\n{chr(10).join(cert_lines)}\n\n"
         'Верни СТРОГО JSON: {"mapping": [индекс_для_сертификата_0, ...]} '

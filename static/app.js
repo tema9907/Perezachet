@@ -161,6 +161,7 @@ function applyEditState(edit) {
       hours: c.hours ?? "",
       grade: c.grade ?? "",
       date: c.date ?? "",
+      verify_url: c.verify_url ?? "",
       _bound: c._bound ?? null,
       _id: nextCertId++,
     }));
@@ -184,6 +185,7 @@ function currentEditState() {
       hours: c.hours,
       grade: c.grade,
       date: c.date,
+      verify_url: c.verify_url || "",
       _bound: c._bound,
     })),
   };
@@ -341,6 +343,10 @@ function makeCertCard(c, idx) {
   card.draggable = true;
   card.dataset.idx = idx;
 
+  const verifyLink = c.verify_url
+    ? `<a class="cert-verify-link" href="${escapeHtml(c.verify_url)}" target="_blank" rel="noopener noreferrer" title="Проверить подлинность">✓ Проверить</a>`
+    : "";
+
   card.innerHTML = `
     <span class="cert-page-badge">стр. ${c.page}</span>
     <div class="cert-actions">
@@ -352,6 +358,7 @@ function makeCertCard(c, idx) {
         <span class="pill" contenteditable="true" data-f="provider">${escapeHtml(c.provider || "—")}</span>
         <span class="pill" contenteditable="true" data-f="hours">${escapeHtml(c.hours || "—")}</span>
         ${c.grade ? `<span class="pill" contenteditable="true" data-f="grade">${escapeHtml(c.grade)}</span>` : ""}
+        ${verifyLink}
       </div>
     </div>
   `;

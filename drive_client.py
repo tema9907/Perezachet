@@ -293,3 +293,30 @@ class DriveClient:
         log(f"Drive: ✓ загружено «{filename}», file_id={out_id}")
         return out_id
 
+    def upload_pdf_to_folder(self, *, folder_id: str, filename: str, data: bytes) -> str:
+        require_shared = self.auth_kind == "service_account"
+        access = self.verify_folder_access(
+            folder_id, label="Папка заявлений", for_upload=require_shared
+        )
+        if not access["ok"]:
+            raise RuntimeError(access["message"])
+        log(f"Drive: загрузка PDF «{filename}» ({len(data)} байт) → «{access.get('name') or folder_id}»")
+        media = MediaIoBaseUpload(io.BytesIO(data), mimetype="application/pdf", resumable=False)
+        meta = {"name": filename, "parents": [folder_id]}
+        try:
+            created = (
+                self.svc.files()
+                .create(body=meta, media_body=media, fields="id", supportsAllDrives=True)
+                .execute()
+            )
+        except Exception as e:
+            err = str(e)
+            if "storageQuotaExceeded" in err or "storage quota" in err.lower():
+                raise RuntimeError(_SA_UPLOAD_HINT.format(email=self.service_account_email)) from e
+            if "404" in err or "notFound" in err:
+                raise RuntimeError(f"Нет доступа к папке заявлений {folder_id}: {err}") from e
+            raise
+        out_id = created["id"]
+        log(f"Drive: ✓ PDF загружен «{filename}», file_id={out_id}")
+        return out_id
+

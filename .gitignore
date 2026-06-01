@@ -11,3 +11,8 @@ secrets/
 **/oauth-client.json
 **/drive-oauth-token.json
 .data/
+.idea/
+.claude/
+.claude-flow/
+.swarm/
+

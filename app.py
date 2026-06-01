@@ -18,16 +18,23 @@ try:
 except ImportError:
     pass
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+import json
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import analyzer
+import application_generator
 import doc_generator
 from drive_client import DriveClient
 from queue_store import QueueStore
 from syslog import log
+
+INTAKE_FOLDER_ID = os.environ.get(
+    "DRIVE_INTAKE_FOLDER_ID", "10hRhC-6SM3ucGCqiTXcbUcigbq-yVhQz"
+).strip()
 
 app = FastAPI(title="Экспертное заключение — генератор")
 
@@ -74,6 +81,7 @@ class CertOut(BaseModel):
     date: str = ""
     student_name: str = ""
     certificate_id: str = ""
+    verify_url: str = ""
 
 
 class AnalyzeResponse(BaseModel):
@@ -189,6 +197,7 @@ def _result_to_queue_payload(result, mapping: dict[int, int]) -> tuple[dict[str,
         ],
         "mapping": {str(k): v for k, v in mapping.items()},
         "errors": result.errors,
+        "plan_data": result.application.plan_data or {},
     }
     edit_json = {
         "student": {
@@ -513,6 +522,7 @@ async def approve_request(request_id: int):
         raise HTTPException(status_code=400, detail=out_access["message"])
 
     edit = r.edit_json or {}
+    plan_data_for_report = (r.analyze_json or {}).get("plan_data") or {}
     # формируем payload для doc_generator из сохранённого черновика
     student = edit.get("student") or {}
     disciplines = edit.get("disciplines") or []
@@ -582,7 +592,7 @@ async def approve_request(request_id: int):
                 for rr in gen_req.rows
             ],
         )
-        data = doc_generator.build_report(payload)
+        data = doc_generator.build_report(payload, plan_data=plan_data_for_report or None)
         safe_name = re.sub(r"[^\w\-]+", "_", gen_req.student_name) or f"request_{r.id}"
         filename = f"ЭЗ_{safe_name}.docx"
         log(f"API /requests/{request_id}/approve: DOCX {len(data)} байт, загрузка в Drive…")
@@ -901,6 +911,122 @@ async def _drive_poll_loop() -> None:
 
         log(f"Воркер: пауза {interval_s} с…")
         await asyncio.sleep(max(10, interval_s))
+
+
+# ---------------------------------------------------------------------------
+# Intake (student application) module
+# ---------------------------------------------------------------------------
+@app.get("/intake")
+async def intake_page():
+    return FileResponse(str(STATIC_DIR / "intake.html"))
+
+
+@app.post("/api/intake/generate")
+async def intake_generate(request: Request):
+    form = await request.form()
+    data_json = form.get("data") or "{}"
+    try:
+        payload_dict = json.loads(data_json)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Невалидный JSON в поле data")
+
+    raw_subjects = payload_dict.get("subjects") or []
+    subjects_list = []
+    for s in raw_subjects:
+        if isinstance(s, dict):
+            name = str(s.get("name") or "").strip()
+            certs_raw = s.get("certs") or []
+            sources = [str(c.get("source") or "").strip() for c in certs_raw if str(c.get("source") or "").strip()]
+        else:
+            name = str(s).strip()
+            sources = []
+        if name:
+            subjects_list.append(application_generator.SubjectEntry(name=name, cert_sources=sources))
+
+    p = application_generator.ApplicationPayload(
+        student_name=str(payload_dict.get("student_name") or ""),
+        faculty=str(payload_dict.get("faculty") or ""),
+        department=str(payload_dict.get("department") or ""),
+        group=str(payload_dict.get("group") or ""),
+        course_year=str(payload_dict.get("course_year") or ""),
+        phone=str(payload_dict.get("phone") or ""),
+        date=str(payload_dict.get("date") or ""),
+        subjects=subjects_list,
+    )
+
+    log(f"API /intake/generate: «{p.student_name}», предметов={len(p.subjects)}")
+
+    docx_bytes = application_generator.build_application_docx(p)
+
+    # Collect certificate files: keys are cert_{subj_idx}_{cert_idx}
+    cert_bytes_map: dict[tuple[int, int], bytes] = {}
+    cert_names_map: dict[tuple[int, int], str] = {}
+    for field_name, field_value in form.multi_items():
+        if field_name.startswith("cert_"):
+            try:
+                parts = field_name[5:].split("_")
+                si, ci = int(parts[0]), int(parts[1])
+                content = await field_value.read()
+                if content:
+                    cert_bytes_map[(si, ci)] = content
+                    cert_names_map[(si, ci)] = getattr(field_value, "filename", "") or ""
+            except Exception:
+                pass
+
+    # Flatten certs in subject/cert order for combined PDF
+    cert_list: list[bytes] = []
+    cert_fnames: list[str] = []
+    for si, subj in enumerate(p.subjects):
+        n_certs = len((raw_subjects[si].get("certs") or [])) if si < len(raw_subjects) and isinstance(raw_subjects[si], dict) else 1
+        for ci in range(max(n_certs, 1)):
+            b = cert_bytes_map.get((si, ci), b"")
+            if b:
+                cert_list.append(b)
+                cert_fnames.append(cert_names_map.get((si, ci), ""))
+
+    drive_url = ""
+    drive_error = ""
+    try:
+        app_pdf = application_generator.build_application_pdf_page(p)
+        combined_pdf = application_generator.build_combined_pdf(
+            app_pdf, cert_list, payload=p, cert_groups=None, cert_filenames=cert_fnames
+        )
+
+        upload_client = _make_upload_drive_client()
+        if upload_client is None:
+            drive_error = "Drive не настроен (нет учётных данных)"
+        elif not INTAKE_FOLDER_ID:
+            drive_error = "DRIVE_INTAKE_FOLDER_ID не задан"
+        else:
+            safe = re.sub(r"[^\w\-]+", "_", p.student_name) or "Заявление"
+            pdf_name = f"Заявление_{safe}.pdf"
+            fid = upload_client.upload_pdf_to_folder(
+                folder_id=INTAKE_FOLDER_ID, filename=pdf_name, data=combined_pdf
+            )
+            drive_url = f"https://drive.google.com/file/d/{fid}/view"
+            log(f"API /intake/generate: PDF загружен → {drive_url}")
+    except Exception as ex:
+        drive_error = str(ex)
+        log(f"API /intake/generate: ошибка Drive — {ex}")
+
+    safe_name = re.sub(r"[^\w\-]+", "_", p.student_name) or "Заявление"
+    docx_filename = f"Заявление_{safe_name}.docx"
+    encoded = urllib.parse.quote(docx_filename)
+    headers: dict[str, str] = {
+        "Content-Disposition": (
+            f'attachment; filename="application.docx"; filename*=utf-8\'\'{encoded}'
+        ),
+    }
+    if drive_url:
+        headers["X-Drive-Url"] = drive_url
+    if drive_error:
+        headers["X-Drive-Error"] = urllib.parse.quote(drive_error[:500])
+
+    return Response(
+        content=docx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers=headers,
+    )
 
 
 @app.on_event("startup")

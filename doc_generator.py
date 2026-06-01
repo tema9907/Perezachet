@@ -1,5 +1,6 @@
 """
 Генерация итогового docx «Экспертное заключение».
+Использует discipline_db для автозаполнения кредитов и расчёта соответствия.
 Структура таблицы повторяет колонки из примера (без сложного форматирования):
 
   №, ФИО, ОП, Курс,
@@ -13,6 +14,11 @@ from __future__ import annotations
 import io
 import re
 from dataclasses import dataclass, field
+
+try:
+    import discipline_db as _ddb
+except ImportError:
+    _ddb = None  # type: ignore
 
 from docx import Document
 from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
@@ -109,6 +115,68 @@ def short_program_name(code_and_title: str) -> str:
     if m:
         return m.group(1).strip()
     return code_and_title.strip()
+
+
+def enrich_row(row: DisciplineRow, plan_data: dict | None = None) -> DisciplineRow:
+    """Обогащает строку: кредиты и соответствие.
+
+    plan_data (из страницы Приложения) имеет приоритет над discipline_db.
+    """
+    # Build DisciplineInfo from plan_data or DB
+    info = None
+    if plan_data and row.discipline:
+        entry = plan_data.get(row.discipline)
+        if entry is None and _ddb:
+            # Try fuzzy match within plan_data keys
+            for key in plan_data:
+                candidate = _ddb.fuzzy_lookup(key)
+                if candidate and _ddb.fuzzy_lookup(row.discipline) and (
+                    candidate.name == _ddb.fuzzy_lookup(row.discipline).name
+                ):
+                    entry = plan_data[key]
+                    break
+        if entry:
+            if _ddb:
+                from discipline_db import DisciplineInfo
+                info = DisciplineInfo(
+                    name=row.discipline,
+                    credits=int(entry.get("credits") or 0),
+                    lec=int(entry.get("lec") or 0),
+                    prac=int(entry.get("prac") or 0),
+                    lab=int(entry.get("lab") or 0),
+                    sro=int(entry.get("sro") or 0),
+                )
+
+    if info is None and _ddb:
+        info = _ddb.fuzzy_lookup(row.discipline)
+
+    if info is None:
+        return row
+
+    # Fill credits if missing
+    credits_val = str(info.credits) if info.credits else row.plan_credits
+    if not row.plan_credits or row.plan_credits == "0":
+        row = DisciplineRow(
+            discipline=row.discipline, plan_credits=credits_val,
+            courses=row.courses, total_hours=row.total_hours,
+            grade_points=row.grade_points, compliance=row.compliance,
+            note=row.note, final_grade=row.final_grade,
+        )
+
+    # Calculate compliance
+    if row.compliance in ("", "полное", "частичное") and _ddb:
+        cert_hours_total = sum(
+            _ddb.parse_cert_hours(c.hours) for c in row.courses if c.hours
+        )
+        computed = _ddb.compliance_status(info, cert_hours_total)
+        if computed:
+            row = DisciplineRow(
+                discipline=row.discipline, plan_credits=row.plan_credits,
+                courses=row.courses, total_hours=row.total_hours,
+                grade_points=row.grade_points, compliance=computed,
+                note=row.note, final_grade=row.final_grade,
+            )
+    return row
 
 
 def format_student_name(name: str) -> str:
@@ -208,19 +276,51 @@ HEADER_FONT_SIZE_PT = 12
 # Ширины 1-в-1 как в референсе ЭЗ_Умербеков_Н_ИС-у-25.docx (сумма 28.25 см).
 # Чтобы таблица влезла без обрезания, поля страницы делаем 1.0 см.
 COL_WIDTHS_CM: list[float] = [
-    0.75,  # 0: №
-    3.38,  # 1: ФИО
-    2.75,  # 2: ОП
-    1.00,  # 3: Курс
-    4.00,  # 4: Дисциплина
-    1.25,  # 5: Кредиты
-    5.31,  # 6: Курсы
-    1.19,  # 7: Часы
-    2.00,  # 8: Баллы
-    3.25,  # 9: Соответствие
-    1.00,  # 10: Примечание
-    2.37,  # 11: Зачтённая оценка
+    0.6,   # №
+    3.0,   # ФИО
+    2.3,   # ОП
+    0.8,   # Курс
+    3.5,   # Дисциплина
+    1.0,   # Кредиты
+    4.8,   # Курсы
+    1.0,   # Часы
+    1.6,   # Баллы
+    2.8,   # Соответствие
+    0.8,   # Примечание
+    2.0,   # Итог
 ]
+
+
+
+
+
+def _set_cell_margins(table, top=50, left=50, bottom=50, right=50):
+    from docx.oxml import OxmlElement
+
+    tbl = table._tbl
+    tblPr = tbl.tblPr
+
+    tblCellMar = tblPr.find(qn('w:tblCellMar'))
+    if tblCellMar is None:
+        tblCellMar = OxmlElement('w:tblCellMar')
+        tblPr.append(tblCellMar)
+
+    for m, v in [('top', top), ('left', left), ('bottom', bottom), ('right', right)]:
+        node = tblCellMar.find(qn(f'w:{m}'))
+        if node is None:
+            node = OxmlElement(f'w:{m}')
+            tblCellMar.append(node)
+        node.set(qn('w:w'), str(v))
+        node.set(qn('w:type'), 'dxa')
+
+
+
+
+
+
+
+
+
 
 # Колонки данных, которые выравниваем по центру (короткие числовые поля).
 # Остальные — по левому краю.
@@ -313,7 +413,7 @@ def _add_borders(table) -> None:
         tbl_pr.append(borders)
 
 
-def build_report(payload: ReportPayload) -> bytes:
+def build_report(payload: ReportPayload, plan_data: dict | None = None) -> bytes:
     doc = Document()
     _set_landscape(doc.sections[0])
 
@@ -346,7 +446,7 @@ def build_report(payload: ReportPayload) -> bytes:
 
     doc.add_paragraph("")
 
-    rows_data = payload.rows or [DisciplineRow()]
+    rows_data = [enrich_row(r, plan_data) for r in (payload.rows or [DisciplineRow()])]
 
     table = doc.add_table(rows=2 + len(rows_data), cols=12)
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
@@ -410,6 +510,7 @@ def build_report(payload: ReportPayload) -> bytes:
 
     _set_col_widths(table, COL_WIDTHS_CM)
     _add_borders(table)
+    _set_cell_margins(table)
 
     # Подписи экспертов — формат как в референсе: длинные с табами/nbsp
     doc.add_paragraph("")
