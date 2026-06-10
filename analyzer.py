@@ -739,9 +739,41 @@ def analyze_pdf(
     def _needs_hours(h: str) -> bool:
         return not h or h in ("", "—", "0", "0 ч", "0 часов")
 
+    def _gemini_reread_cert(cert_page_idx: int) -> dict[str, Any]:
+        """Повторно читает страницу сертификата через Gemini (если доступен)."""
+        gemini_p = next(
+            (p for p in providers if isinstance(p, GeminiProvider) and p.is_available()),
+            None,
+        )
+        if gemini_p is None:
+            log.info("cert page %d: Gemini not available for re-read", cert_page_idx)
+            return {}
+        if cert_page_idx - 1 >= len(pages):
+            log.warning("cert page %d: page index out of range (have %d pages)", cert_page_idx, len(pages))
+            return {}
+        try:
+            log.info("cert page %d: ↺ re-analyzing image with Gemini to get correct URL…", cert_page_idx)
+            result = gemini_p.analyze(CERTIFICATE_PROMPT, pages[cert_page_idx - 1])
+            log.info(
+                "cert page %d: Gemini re-read → hours=%r  verify_url=%r",
+                cert_page_idx,
+                result.get("hours", ""),
+                result.get("verify_url", ""),
+            )
+            return result
+        except Exception as _e:
+            log.warning("cert page %d: Gemini re-analysis failed: %s", cert_page_idx, _e)
+            return {}
+
     for cert in certs:
+        log.info(
+            "cert page %d (%r): hours=%r  verify_url=%r",
+            cert.page, cert.course_title[:40] if cert.course_title else "",
+            cert.hours, cert.verify_url,
+        )
         if not _needs_hours(cert.hours):
-            continue  # already has hours from image
+            log.info("cert page %d: hours already set, skipping URL check", cert.page)
+            continue
         urls_to_try = []
         if cert.verify_url:
             urls_to_try.append(cert.verify_url)
@@ -750,18 +782,75 @@ def analyze_pdf(
             if u not in urls_to_try:
                 urls_to_try.append(u)
 
+        if not urls_to_try:
+            log.info("cert page %d: no verify URL found, hours will remain empty", cert.page)
+            continue
+
+        log.info("cert page %d: %d URL(s) to try: %s", cert.page, len(urls_to_try),
+                 ", ".join(u[:70] for u in urls_to_try[:3]))
+
         for url in urls_to_try[:3]:  # max 3 URLs per cert
             try:
                 info = _cv.fetch_cert_info(url)
-                if info.get("hours") and float(info["hours"]) > 0:
-                    cert.hours = f"{int(float(info['hours']))} ч"
-                    if not cert.verify_url:
-                        cert.verify_url = url
-                    log.info("cert page %d: hours from URL → %s", cert.page, cert.hours)
-                    # Update course title if not extracted from image
-                    if not cert.course_title and info.get("course_title"):
-                        cert.course_title = info["course_title"]
+
+                if info.get("not_found"):
+                    log.info(
+                        "cert page %d: URL not-found → triggering Gemini re-read  (bad url=%s)",
+                        cert.page, url,
+                    )
+                    # Страница вернула «не найдено» — перечитываем через Gemini
+                    redata = _gemini_reread_cert(cert.page)
+                    # Если Gemini нашёл часы прямо в изображении — берём их
+                    rehours = str(redata.get("hours", "")).strip()
+                    if rehours and not _needs_hours(rehours):
+                        cert.hours = rehours
+                        log.info("cert page %d: ✓ hours from Gemini image re-read → %s", cert.page, cert.hours)
+                        break
+                    # Если Gemini дал другую ссылку — идём по ней
+                    reurl = str(redata.get("verify_url", "")).strip()
+                    if reurl and reurl != url:
+                        log.info("cert page %d: Gemini gave corrected URL → %s", cert.page, reurl)
+                        reinfo = _cv.fetch_cert_info(reurl)
+                        if not reinfo.get("not_found") and reinfo.get("hours"):
+                            try:
+                                h = float(reinfo["hours"])
+                                if h > 0:
+                                    cert.hours = f"{int(h)} ч"
+                                    cert.verify_url = reurl
+                                    log.info("cert page %d: ✓ hours from Gemini corrected URL → %s", cert.page, cert.hours)
+                                    if not cert.course_title and reinfo.get("course_title"):
+                                        cert.course_title = reinfo["course_title"]
+                                    break
+                            except (ValueError, TypeError):
+                                pass
+                        else:
+                            log.info(
+                                "cert page %d: Gemini corrected URL also not-found or no hours → hours empty",
+                                cert.page,
+                            )
+                    else:
+                        if reurl == url:
+                            log.info("cert page %d: Gemini returned same URL, cannot correct", cert.page)
+                        else:
+                            log.info("cert page %d: Gemini gave no URL either → hours empty", cert.page)
+                    log.info("cert page %d: ✗ could not resolve hours via URL, leaving empty", cert.page)
                     break
+
+                if info.get("hours"):
+                    try:
+                        h = float(info["hours"])
+                        if h > 0:
+                            cert.hours = f"{int(h)} ч"
+                            if not cert.verify_url:
+                                cert.verify_url = url
+                            log.info("cert page %d: ✓ hours from URL → %s", cert.page, cert.hours)
+                            if not cert.course_title and info.get("course_title"):
+                                cert.course_title = info["course_title"]
+                            break
+                    except (ValueError, TypeError):
+                        pass
+                else:
+                    log.info("cert page %d: URL OK but no hours found at %s", cert.page, url[:70])
             except Exception as _url_err:
                 log.warning("cert URL enrich failed (%s): %s", url[:60], _url_err)
 

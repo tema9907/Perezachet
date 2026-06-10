@@ -140,15 +140,16 @@ def _title_from_html(html: str) -> str:
 # ---------------------------------------------------------------------------
 # Fetch & parse
 # ---------------------------------------------------------------------------
-def _fetch(url: str) -> str:
+def _fetch(url: str) -> tuple[int, str]:
+    """Возвращает (http_status, html). status=0 при сетевой ошибке."""
     try:
         with httpx.Client(timeout=_TIMEOUT, follow_redirects=True, headers=_HEADERS) as client:
             r = client.get(url)
-            if r.status_code == 200:
-                return r.text
+            log.info("  HTTP %d ← %s", r.status_code, url[:100])
+            return r.status_code, r.text
     except Exception as e:
-        log.warning("fetch failed %s: %s", url[:80], e)
-    return ""
+        log.warning("  fetch error for %s: %s", url[:80], e)
+    return 0, ""
 
 
 def _parse_html(html: str) -> dict[str, Any]:
@@ -172,17 +173,92 @@ def _parse_html(html: str) -> dict[str, Any]:
     return info
 
 
+# Паттерны soft-404 в <title> и og:title (рендерятся SSR, надёжнее тела страницы)
+_NOT_FOUND_TITLE_PATTERNS: tuple[str, ...] = (
+    "интересное открытие",
+    "interesting discovery",
+    "page not found",
+    "страница не найдена",
+    "not found",
+    "404",
+    "doesn't exist",
+    "не существует",
+)
+
+# Паттерны в теле страницы (для серверных страниц без SPA)
+_NOT_FOUND_BODY_PATTERNS: tuple[str, ...] = (
+    "интересное открытие",
+    "interesting discovery",
+    "вы нашли несуществующую",
+    "you've found a page that doesn't exist",
+    "this certificate does not exist",
+    "certificate not found",
+    "no certificate found",
+    "we couldn't find the page",
+    "мы не можем найти эту страницу",
+    "такой страницы не существует",
+    "запрашиваемая страница не найдена",
+    # Next.js / JSON state embeds
+    '"statusCode":404',
+    '"status":404',
+    '"notFound":true',
+)
+
+
+def is_not_found_page(html: str) -> bool:
+    """Возвращает True если страница — soft-404 / «не найдено».
+
+    Проверяет <title>/og:title (SSR-надёжно) + тело страницы (для не-SPA).
+    Для SPA (Coursera) основной сигнал — HTTP 404, которое обрабатывается
+    до вызова этой функции в fetch_cert_info.
+    """
+    if not html:
+        return False
+    # Проверяем <title> / og:title — они всегда в SSR-HTML
+    title = _title_from_html(html).lower()
+    if any(p in title for p in _NOT_FOUND_TITLE_PATTERNS):
+        log.info("  not-found detected via title: %r", title[:80])
+        return True
+    # Проверяем тело
+    lower = html.lower()
+    for p in _NOT_FOUND_BODY_PATTERNS:
+        if p in lower:
+            log.info("  not-found detected via body pattern: %r", p)
+            return True
+    return False
+
+
 def fetch_cert_info(url: str) -> dict[str, Any]:
     """Загружает страницу верификации сертификата и возвращает данные.
 
-    Возвращает dict с ключами: hours (float), course_title (str) — если найдено.
+    Возвращает dict с ключами:
+      - hours (float), course_title (str) — если найдено.
+      - not_found (True) — если страница вернула «не найдено» / HTTP 404 / soft-404.
     Возвращает {} если страница недоступна или данных нет.
     """
     if not url:
         return {}
-    log.info("verifying cert URL: %s", url[:100])
-    html = _fetch(url)
+    log.info("▶ cert URL check: %s", url)
+    status, html = _fetch(url)
+
+    # HTTP 404 — точный сигнал «не найдено»
+    if status == 404:
+        log.info("  → not_found (HTTP 404)")
+        return {"not_found": True}
+
+    # Сетевая ошибка или неожиданный статус — не считаем «не найдено»
+    if status == 0 or status not in (200, 301, 302):
+        log.info("  → fetch failed or unexpected status %d", status)
+        return {}
+
+    # Soft-404: сервер вернул 200 но страница — «не найдено»
+    if is_not_found_page(html):
+        log.info("  → not_found (soft-404 detected in HTML)")
+        return {"not_found": True}
+
     info = _parse_html(html)
     if info:
-        log.info("cert URL data: %s", info)
+        log.info("  → found data: %s", info)
+    else:
+        log.info("  → page OK but no cert data extracted")
     return info
