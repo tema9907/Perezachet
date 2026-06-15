@@ -1,0 +1,30 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Deploy to Server
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write .env
+        shell: bash
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+          NGROK_DOMAIN: ${{ secrets.NGROK_DOMAIN }}
+        run: |
+          printf 'GEMINI_API_KEY=%s\nNGROK_AUTHTOKEN=%s\nNGROK_DOMAIN=%s\n' \
+            "$GEMINI_API_KEY" "$NGROK_AUTHTOKEN" "$NGROK_DOMAIN" > .env
+
+      - name: Deploy with Docker Compose
+        shell: bash
+        run: |
+          docker compose up -d --build --force-recreate
+          echo "✓ Deployed at $(date)"

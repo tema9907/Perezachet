@@ -1,0 +1,22 @@
+services:
+  app:
+    build: .
+    restart: always
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - nefrlearn_data:/app/.data
+    env_file:
+      - .env
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    restart: always
+    command: http --domain=${NGROK_DOMAIN} app:8765
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
+    depends_on:
+      - app
+
+volumes:
+  nefrlearn_data:

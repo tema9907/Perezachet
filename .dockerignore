@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+.data/
+.git/
+*.pyc
+secrets/
+.claude/
+.claude-flow/
+.swarm/
+.ruflo/
+*.pdf
+*.docx
