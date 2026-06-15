@@ -68,6 +68,60 @@ const GROUPS_BY_DEPARTMENT = {
   }
 };
 
+// Платформы онлайн-курсов
+const CERT_PLATFORMS = [
+  "Coursera", "Udemy", "Stepik", "edX", "Интуит", "Skillbox",
+  "Яндекс Практикум", "Нетология", "GeekBrains", "Hexlet",
+  "Codecademy", "LinkedIn Learning", "Khan Academy",
+  "FutureLearn", "Pluralsight", "Alison", "DataCamp",
+  "Открытое образование", "Лекториум", "Mail.ru Group",
+];
+
+// Ключевые слова → кафедра-держатель (эвристика)
+const SUBJECT_KEYWORD_DEPT = [
+  { keys: ["математик", "алгебра", "геометри", "математическ анализ", "теория вероятност", "статистик", "дискретн", "дифференциал", "тополог", "функциональн анализ", "математическ"], faculty: "ФМЕН", department: "МиФ" },
+  { keys: ["химия", "химическ", "биохими", "органическ химия", "неорганическ химия", "аналитическ химия", "физическ химия", "коллоидн", "электрохими", "хтов", "хэакп"], faculty: "ФМЕН", department: "ХиХТ" },
+  { keys: ["биологи", "ботаник", "зоологи", "генетик", "биофизик", "биотехнологи", "микробиологи", "физиологи растений", "анатомия и морфологи растений", "биоразнообрази", "биоценологи", "экологи", "биоресурс", "биоиндикац"], faculty: "ФМЕН", department: "Б" },
+  { keys: ["геологи", "геодези", "геоморфологи", "картографи", "геохими", "петрографи", "минералог", "геоэкологи", "почвоведени", "ландшафт"], faculty: "ФМЕН", department: "ГЭ" },
+  { keys: ["информатик", "программирован", "базы данных", "web", "интернет-", "алгоритмы", "операционн систем", "архитектура вычислит", "архитектура компьютер", "кибербезопасност", "сети и телекоммуникац", "it-технологи", "smart-технологи"], faculty: "ФИЦТ", department: "ИКТ" },
+  { keys: ["телекоммуникац", "телевидени", "радио", "антенн", "многоканальн", "сигнал обработк", "цифровые измерит", "цифровые электронн", "аналоговые электронн"], faculty: "ФИЦТ", department: "ТиМ" },
+  { keys: ["электроник", "электротехник", "электрическ", "электроэнергетик", "схемотехник", "микропроцессор", "робот", "мехатроник", "автоматическ регулирован", "автоматизирован систем"], faculty: "ФИЦТ", department: "ЭиР" },
+  { keys: ["анатомия человека", "физиологи человека", "клиническ", "стоматологи", "педиатри", "хирурги", "терапи", "медицин", "патологи", "анатомия 1", "анатомия 2", "биологи человека"], faculty: "МФ", department: "КД" },
+  { keys: ["фармацевт", "фармаци", "фармакологи", "аптечн"], faculty: "МФ", department: "ФМ" },
+  { keys: ["педагогик", "дидактик", "методика преподавани", "методика обучени", "дошкольн", "начальн образовани", "специальн образовани", "коррекционн", "логопеди"], faculty: "ПФ", department: "ПП" },
+  { keys: ["физическа культур", "физкультур", "спортивна", "адаптивн физическа", "спортивн менеджмент", "физическа подготовк", "лечебн физическ", "биомеханик", "спортивн метрологи"], faculty: "ПФ", department: "ФКС" },
+  { keys: ["английск", "немецк", "иностранн язык", "перевод", "лингвистик", "практическ курс английск", "иноязычн"], faculty: "ИЯиЛ", department: "ГРФ" },
+  { keys: ["казахск язык", "казахска литература", "казаховедени", "абаеведени", "абайтану", "алашеведени"], faculty: "ИЯиЛ", department: "КЯЛ" },
+  { keys: ["русск язык", "русска литература", "русская литература", "стилистик русск", "филологи"], faculty: "ИЯиЛ", department: "РЛ" },
+  { keys: ["журналистик", "медиа-", "pr-", "smm", "реклам", "средства массов информации", "аудиожурналист"], faculty: "ФИЭП", department: "ЖСН" },
+  { keys: ["экономик", "финансов", "бухгалтер", "аудит", "налогооблож", "бизнес", "предпринимательств", "банковск", "маркетинг", "менеджмент", "логистик"], faculty: "ФИЭП", department: "ЭУФ" },
+  { keys: ["право", "юриспруденци", "юридическ", "адвокатур", "правоведени", "уголовн", "гражданск право", "конституционн", "административн право", "прокурорск"], faculty: "ФИЭП", department: "ИКиП" },
+  { keys: ["агро", "агрономи", "ветеринари", "животноводств", "растениеводств", "лесн хозяйств", "зоотехни", "ихтиологи", "рыбоводств", "агробиологи", "агробизнес", "агробиотехнологи", "агрохими", "агрометеорологи"], faculty: "АФ", department: "АЛ" },
+  { keys: ["пищевых продуктов", "переработк продукт", "продуктов питания", "продовольств", "технологи хранени", "биологическа безопасност продукт"], faculty: "АФ", department: "ПБ" },
+];
+
+function guessDeptForSubject(name) {
+  if (!name) return null;
+  const lower = name.toLowerCase();
+  for (const rule of SUBJECT_KEYWORD_DEPT) {
+    if (rule.keys.some(k => lower.includes(k.toLowerCase()))) {
+      return { faculty: rule.faculty, department: rule.department };
+    }
+  }
+  return null;
+}
+
+// Обратный индекс: группа → { faculty, department }
+const GROUP_TO_FACULTY_DEPT = (() => {
+  const map = {};
+  for (const [faculty, depts] of Object.entries(GROUPS_BY_DEPARTMENT)) {
+    for (const [dept, groups] of Object.entries(depts)) {
+      for (const g of groups) map[g] = { faculty, department: dept };
+    }
+  }
+  return map;
+})();
+
 const SUBJECTS = [
   "BIM-технологии в архитектурно-строительном проектировании",
   "BIM-технологии в инженерных системах/Реконструкция и ремонт зданий",
@@ -2613,7 +2667,20 @@ const cbDepartment = initCombobox($("cb-department"), () => depOptions, (dept) =
     ?? (currentFaculty ? GROUPS_BY_FACULTY[currentFaculty] || [] : Object.values(GROUPS_BY_FACULTY).flat().sort());
   cbGroup.setValue("");
 });
-const cbGroup = initCombobox($("cb-group"), () => groupOptions);
+const cbGroup = initCombobox($("cb-group"), () => groupOptions, (group) => {
+  const match = GROUP_TO_FACULTY_DEPT[group];
+  if (match) {
+    if (!cbFaculty.getValue()) {
+      cbFaculty.setValue(match.faculty);
+      currentFaculty = match.faculty;
+      depOptions = DEPARTMENTS_BY_FACULTY[match.faculty] || [];
+      groupOptions = GROUPS_BY_FACULTY[match.faculty] || [];
+    }
+    if (!cbDepartment.getValue()) {
+      cbDepartment.setValue(match.department);
+    }
+  }
+});
 
 // ==== Subject management ====
 // subjectsMap: id -> { name, certsMap: Map(certId -> { source, file, fileName }) }
@@ -2637,7 +2704,10 @@ function addCertItem(subjectId, certsContainer) {
   item.className = "cert-item";
   item.dataset.certId = certId;
   item.innerHTML = `
-    <input type="text" class="cert-source-input" placeholder="Откуда (Coursera, Udemy, Stepik...)">
+    <div class="combobox cert-source-cb" style="flex:1;min-width:120px;">
+      <input class="cb-input" type="text" placeholder="Coursera, Udemy, Stepik...">
+      <div class="cb-dropdown hidden"></div>
+    </div>
     <label class="cert-upload-label">
       <input type="file" accept="application/pdf,image/jpeg,image/png,image/webp,image/gif" class="cert-file-input" hidden>
       <span class="cert-upload-btn btn-ghost">Прикрепить PDF</span>
@@ -2646,10 +2716,11 @@ function addCertItem(subjectId, certsContainer) {
     <button class="btn-danger-ghost cert-remove-btn" title="Удалить сертификат">✕</button>
   `;
 
-  const sourceInput = item.querySelector(".cert-source-input");
-  sourceInput.addEventListener("input", () => {
-    entry.certsMap.get(certId).source = sourceInput.value.trim();
-  });
+  initCombobox(
+    item.querySelector(".cert-source-cb"),
+    () => CERT_PLATFORMS,
+    (val) => { entry.certsMap.get(certId).source = val; }
+  );
 
   const fileInput = item.querySelector(".cert-file-input");
   const certNameLabel = item.querySelector(".cert-name-label");
@@ -2685,7 +2756,7 @@ function addCertItem(subjectId, certsContainer) {
 
 function addSubjectRow(initialName = "") {
   const id = nextSubjectId++;
-  subjectsMap.set(id, { name: initialName, certsMap: new Map() });
+  subjectsMap.set(id, { name: initialName, certsMap: new Map(), faculty: "", department: "" });
 
   const row = document.createElement("div");
   row.className = "subject-row";
@@ -2701,17 +2772,96 @@ function addSubjectRow(initialName = "") {
         </div>
         <button class="btn-danger-ghost subject-remove-btn" title="Удалить предмет">✕</button>
       </div>
+      <div class="subject-fac-dept-block">
+        <div class="fac-dept-header">
+          Кафедра-держатель предмета
+          <span class="fac-dept-required-badge">обязательно</span>
+          <span class="fac-dept-tip" title="Кафедра, которая ведёт этот предмет и будет утверждать экспертное заключение">— та, чьё ЭЗ нужно получить</span>
+        </div>
+        <div class="fac-dept-selects">
+          <div class="combobox subj-fac-cb">
+            <input class="cb-input" type="text" placeholder="Факультет" autocomplete="off">
+            <div class="cb-dropdown hidden"></div>
+          </div>
+          <div class="combobox subj-dep-cb">
+            <input class="cb-input" type="text" placeholder="Кафедра" autocomplete="off">
+            <div class="cb-dropdown hidden"></div>
+          </div>
+        </div>
+        <div class="fac-dept-selected">
+          <span class="fac-dept-selected-text"></span>
+        </div>
+        <div class="subj-required-hint">⚠ Укажите кафедру-держателя перед отправкой</div>
+      </div>
       <div class="subject-certs-container"></div>
       <button class="btn-ghost add-cert-btn">+ Добавить сертификат</button>
     </div>
   `;
 
+  const entry = subjectsMap.get(id);
+
+  let cbSubjFac, cbSubjDep;
+  let subjDepOptions = [];
+
+  function updateFacDeptDisplay() {
+    const selectedEl = row.querySelector(".fac-dept-selected");
+    const selectedText = row.querySelector(".fac-dept-selected-text");
+    const hint = row.querySelector(".subj-required-hint");
+    if (entry.faculty || entry.department) {
+      const parts = [entry.faculty, entry.department].filter(Boolean);
+      selectedText.innerHTML = parts.map((p, i) =>
+        i < parts.length - 1
+          ? `${escapeHtml(p)} <span class="fac-dept-selected-arrow">→</span>`
+          : escapeHtml(p)
+      ).join(" ");
+      selectedEl.classList.add("visible");
+      hint.classList.remove("visible");
+    } else {
+      selectedEl.classList.remove("visible");
+    }
+  }
+
+  function applyGuessedDept(subjectName) {
+    if (entry.faculty || entry.department) return;
+    if (!cbSubjFac || !cbSubjDep) return;
+    const guess = guessDeptForSubject(subjectName);
+    if (!guess) return;
+    entry.faculty = guess.faculty;
+    cbSubjFac.setValue(guess.faculty);
+    subjDepOptions = DEPARTMENTS_BY_FACULTY[guess.faculty] || [];
+    entry.department = guess.department;
+    cbSubjDep.setValue(guess.department);
+    updateFacDeptDisplay();
+  }
+
+  // Subject name combobox
   const cb = initCombobox(
     row.querySelector(".combobox"),
     () => SUBJECTS,
-    (val) => { subjectsMap.get(id).name = val; }
+    (val) => { entry.name = val; applyGuessedDept(val); }
   );
   if (initialName) cb.setValue(initialName);
+
+  // Subject faculty/dept comboboxes (кафедра-держатель предмета)
+  cbSubjFac = initCombobox(
+    row.querySelector(".subj-fac-cb"),
+    () => FACULTIES,
+    (fac) => {
+      entry.faculty = fac;
+      subjDepOptions = DEPARTMENTS_BY_FACULTY[fac] || [];
+      cbSubjDep.setValue("");
+      entry.department = "";
+      updateFacDeptDisplay();
+    }
+  );
+  cbSubjDep = initCombobox(
+    row.querySelector(".subj-dep-cb"),
+    () => subjDepOptions,
+    (dep) => {
+      entry.department = dep;
+      updateFacDeptDisplay();
+    }
+  );
 
   const certsContainer = row.querySelector(".subject-certs-container");
 
@@ -2744,9 +2894,25 @@ $("generateBtn").addEventListener("click", async () => {
     if (!name) continue;
     const certs = [];
     for (const [, c] of s.certsMap) certs.push({ source: c.source || "" });
-    subjects.push({ name, certs });
+    subjects.push({ name, certs, faculty: s.faculty || "", department: s.department || "" });
   }
   if (subjects.length === 0) { toast("Добавьте хотя бы один предмет", "error"); return; }
+
+  // Показать подсказки у предметов без кафедры-держателя
+  let missingDept = 0;
+  document.querySelectorAll(".subject-row").forEach((row) => {
+    const sid = parseInt(row.dataset.subjectId);
+    const entry = subjectsMap.get(sid);
+    const hint = row.querySelector(".subj-required-hint");
+    if (hint && entry && (entry.name || "").trim() && !entry.department) {
+      hint.classList.add("visible");
+      missingDept++;
+    }
+  });
+  if (missingDept > 0) {
+    toast(`Укажите кафедру-держателя для ${missingDept} предм.`, "error");
+    return;
+  }
 
   const payload = {
     student_name: studentName,
@@ -2790,21 +2956,9 @@ $("generateBtn").addEventListener("click", async () => {
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(dlUrl);
 
-    const driveUrl = res.headers.get("X-Drive-Url") || "";
-    const driveErrRaw = res.headers.get("X-Drive-Error") || "";
-    const driveErr = driveErrRaw ? decodeURIComponent(driveErrRaw) : "";
     $("resultBlock").classList.remove("hidden");
-    $("resultText").textContent = `Документ «${docxName}» скачан. PDF с сертификатами:`;
-    if (driveUrl) {
-      $("driveLink").href = driveUrl; $("driveLink").classList.remove("hidden");
-      $("driveErrorText").classList.add("hidden");
-      toast("Документы сформированы и отправлены на Google Drive", "success");
-    } else {
-      $("driveLink").classList.add("hidden");
-      $("driveErrorText").textContent = driveErr ? "Drive: " + driveErr : "Drive не настроен — PDF не отправлен";
-      $("driveErrorText").classList.remove("hidden");
-      toast(driveErr ? "DOCX скачан, Drive недоступен" : "DOCX скачан (Drive не настроен)", driveErr ? "error" : "");
-    }
+    $("resultText").textContent = `Документ «${docxName}» скачан и сохранён на сервере.`;
+    toast("Документы сформированы", "success");
   } catch (e) {
     toast("Ошибка: " + e.message, "error");
   } finally {

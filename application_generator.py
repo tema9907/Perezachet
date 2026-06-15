@@ -273,64 +273,95 @@ def build_application_pdf_page(payload: ApplicationPayload) -> bytes:
 # ---------------------------------------------------------------------------
 def build_subject_analysis_page(
     payload: ApplicationPayload,
-    cert_groups: list[list[bytes]],  # cert_groups[i] = list of cert PDFs for subject i
+    cert_groups: list[list[bytes]],
+    cert_group_names: list[list[str]] | None = None,
 ) -> bytes:
-    """Страница «Приложение к заявлению» — анализ дисциплин, часов, кредитов."""
+    """Страница 2: чёткая таблица — какой сертификат (Прил. №N, стр. X) к какой дисциплине."""
     import fitz
-    import discipline_db as ddb
+
+    # Вычисляем номера вложений и страниц
+    page_cursor = 3  # стр.1=заявление, стр.2=эта страница, стр.3+=сертификаты
+    attach_num = 1
+    total_attachments = 0
+    rows_html = ""
+
+    for si, subj in enumerate(payload.subjects):
+        group = cert_groups[si] if si < len(cert_groups) else []
+        names = cert_group_names[si] if cert_group_names and si < len(cert_group_names) else []
+
+        # Заголовок дисциплины
+        rows_html += (
+            f"<tr style='background:#e8f0fb;'>"
+            f"<td colspan='3' style='padding:6pt 8pt;font-weight:700;font-size:10.5pt;"
+            f"border-top:2px solid #c7d9f5;'>{si + 1}.&nbsp;{subj.name}</td></tr>"
+        )
+
+        if group:
+            for ci, cert_bytes in enumerate(group):
+                src = subj.cert_sources[ci] if ci < len(subj.cert_sources) else ""
+                fname = names[ci] if ci < len(names) else ""
+                src_short = (src[:75] + "…") if len(src) > 75 else src
+
+                # Считаем страницы сертификата для точной ссылки
+                n_pages = 1
+                try:
+                    pdf_data = cert_data_to_pdf(cert_bytes, fname)
+                    c_doc = fitz.open("pdf", pdf_data)
+                    n_pages = len(c_doc)
+                    c_doc.close()
+                except Exception:
+                    pass
+
+                page_ref = (
+                    f"стр.&nbsp;{page_cursor}"
+                    if n_pages == 1
+                    else f"стр.&nbsp;{page_cursor}–{page_cursor + n_pages - 1}"
+                )
+
+                rows_html += (
+                    f"<tr><td style='padding:5pt 8pt;color:#1d4ed8;font-weight:700;"
+                    f"white-space:nowrap;'>Прил.&nbsp;№{attach_num}</td>"
+                    f"<td style='padding:5pt 8pt;color:#475569;font-size:8.5pt;"
+                    f"white-space:nowrap;'>{page_ref}</td>"
+                    f"<td style='padding:5pt 8pt;font-size:8.5pt;'>{src_short or '—'}</td></tr>"
+                )
+                page_cursor += n_pages
+                attach_num += 1
+                total_attachments += 1
+        else:
+            # Нет прикреплённых файлов
+            src_hint = "; ".join(subj.cert_sources[:3]) if subj.cert_sources else ""
+            rows_html += (
+                f"<tr><td colspan='3' style='padding:5pt 8pt;color:#94a3b8;"
+                f"font-size:8.5pt;font-style:italic;'>файл не прикреплён"
+                f"{(' — ' + src_hint) if src_hint else ''}</td></tr>"
+            )
+
+    html = (
+        "<div style='font-family:\"Times New Roman\",Times,serif;font-size:10pt;color:#000;'>"
+        "<h2 style='text-align:center;font-size:12pt;margin:0 0 6pt;'>Приложение к заявлению</h2>"
+        "<p style='text-align:center;font-size:9pt;color:#475569;margin:0 0 10pt;'>"
+        "Распределение приложенных сертификатов по дисциплинам</p>"
+        f"<p style='margin:0 0 10pt;'>"
+        f"<b>Студент:</b> {payload.student_name or '—'}&nbsp;&nbsp;"
+        f"<b>Группа:</b> {payload.group or '—'}&nbsp;&nbsp;"
+        f"<b>Курс:</b> {payload.course_year or '—'}</p>"
+        "<table style='width:100%;border-collapse:collapse;border:1px solid #c7d9f5;'>"
+        "<thead><tr style='background:#1e3a5f;color:#fff;'>"
+        "<th style='padding:6pt 8pt;text-align:left;font-size:9pt;width:15%;'>Вложение</th>"
+        "<th style='padding:6pt 8pt;text-align:left;font-size:9pt;width:16%;'>Страница</th>"
+        "<th style='padding:6pt 8pt;text-align:left;font-size:9pt;'>Источник / URL сертификата</th>"
+        "</tr></thead>"
+        f"<tbody>{rows_html}</tbody></table>"
+        f"<p style='font-size:8pt;color:#475569;margin-top:8pt;'>"
+        f"<b>Итого вложений: {total_attachments}.</b>&nbsp;"
+        "Сертификаты расположены в документе сразу после данной страницы "
+        "(Прил.&nbsp;№1&nbsp;=&nbsp;стр.&nbsp;3).</p>"
+        "</div>"
+    )
 
     doc = fitz.open()
     page = doc.new_page(width=595.276, height=841.89)
-
-    rows_html = ""
-    for i, subj in enumerate(payload.subjects):
-        info = ddb.fuzzy_lookup(subj.name)
-        contact = info.contact_hours if info else 0
-        threshold = info.compliance_threshold if info else 0
-
-        # Sum certificate hours
-        cert_hours = sum(ddb.parse_cert_hours(s) for s in subj.cert_sources if s)
-        status = ddb.compliance_status(info, cert_hours)
-        status_color = "#16a34a" if status == "полное" else "#dc2626" if status == "частичное" else "#64748b"
-
-        cert_items = ""
-        for src in (subj.cert_sources or []):
-            h = ddb.parse_cert_hours(src) if src else 0
-            cert_items += f"<li>{src or '—'}" + (f" ({int(h)} ч)" if h else "") + "</li>"
-        if not cert_items:
-            cert_items = "<li style='color:#94a3b8;'>сертификат не указан</li>"
-
-        rows_html += f"""
-<div style='border:1px solid #e2e8f0;border-radius:8px;padding:10pt;margin-bottom:8pt;'>
-  <div style='display:flex;justify-content:space-between;align-items:baseline;'>
-    <b style='font-size:11pt;'>{i+1}. {subj.name}</b>
-    <span style='font-size:9pt;color:{status_color};font-weight:bold;'>{status or 'нет данных'}</span>
-  </div>
-  <div style='font-size:9pt;color:#475569;margin-top:3pt;'>
-    {'Кредитов: ' + str(info.credits) + ' &nbsp;|&nbsp; ' if info else ''}
-    {'Лекции: ' + str(info.lec) + ' ч, Практики: ' + str(info.prac) + ' ч, Лаборат.: ' + str(info.lab) + ' ч' if info else 'Дисциплина не найдена в базе'}
-    {(' &nbsp;|&nbsp; Порог 50%: ' + str(int(threshold)) + ' ч') if contact else ''}
-  </div>
-  <div style='font-size:9pt;margin-top:4pt;'>Сертификаты: <ul style='margin:2pt 0 0 16pt;padding:0;'>{cert_items}</ul></div>
-  {('<div style="font-size:9pt;margin-top:3pt;">Итого часов по сертификатам: <b>' + str(int(cert_hours)) + ' ч</b></div>') if cert_hours else ''}
-</div>"""
-
-    html = f"""<div style='font-family:"Times New Roman",Times,serif;font-size:10pt;'>
-<h2 style='text-align:center;font-size:13pt;margin:0 0 10pt;'>Приложение к заявлению</h2>
-<p style='text-align:center;font-size:9pt;color:#64748b;margin:0 0 12pt;'>
-  Анализ соответствия сертификатов учебным дисциплинам
-</p>
-<p style='margin:0 0 6pt;'><b>Студент:</b> {payload.student_name or '—'}
-  &nbsp;&nbsp;<b>Группа:</b> {payload.group or '—'}
-  &nbsp;&nbsp;<b>Курс:</b> {payload.course_year or '—'}
-</p>
-<hr style='border:none;border-top:1px solid #cbd5e1;margin:0 0 8pt;'/>
-{rows_html}
-<p style='font-size:8pt;color:#94a3b8;margin-top:8pt;'>
-  * «Полное» — суммарные часы по сертификатам ≥ 50% аудиторных часов по плану (лекции + практики + лабораторные).
-</p>
-</div>"""
-
     rect = fitz.Rect(40, 40, 555, 800)
     if os.path.isdir(_WIN_FONTS):
         try:
@@ -408,8 +439,19 @@ def build_combined_pdf(
     # Page 2: subject analysis (if payload provided)
     if payload and payload.subjects:
         groups = cert_groups or [[] for _ in payload.subjects]
+        # Build per-group filenames from flat cert_filenames
+        group_names: list[list[str]] | None = None
+        if cert_filenames and cert_groups:
+            group_names = []
+            fi = 0
+            for g in cert_groups:
+                gn: list[str] = []
+                for _ in g:
+                    gn.append(cert_filenames[fi] if fi < len(cert_filenames) else "")
+                    fi += 1
+                group_names.append(gn)
         try:
-            analysis_bytes = build_subject_analysis_page(payload, groups)
+            analysis_bytes = build_subject_analysis_page(payload, groups, group_names)
             analysis_doc = fitz.open("pdf", analysis_bytes)
             merged.insert_pdf(analysis_doc)
         except Exception:

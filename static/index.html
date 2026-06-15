@@ -7,32 +7,25 @@
   <title>Экспертное заключение — генератор</title>
   <link rel="stylesheet" href="/static/style.css">
   <link id="favicon" rel="icon" type="image/x-icon" href="/static/favicon.ico">
+  <script src="/static/theme.js"></script>
 </head>
 
 <body>
   <header class="topbar">
-    <div class="brand">
+    <a class="brand" href="/">
       <span class="logo">ЭЗ</span>
-      <div>
-        <h1>Экспертное заключение</h1>
-        <p>Распознавание сертификатов из PDF и генерация итогового документа</p>
-      </div>
-    </div>
-    <div class="api-key-block">
-      <div class="key-row">
-        <label for="openrouterKey">OpenRouter</label>
-        <input id="openrouterKey" type="password" placeholder="sk-or-v1-..." autocomplete="off">
-        <a class="help" href="https://openrouter.ai/keys" target="_blank" rel="noopener">ключ</a>
-      </div>
-      <div class="key-row">
-        <label for="apiKey">Gemini (резерв)</label>
-        <input id="apiKey" type="password" placeholder="AIza..." autocomplete="off">
-        <a class="help" href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">ключ</a>
-      </div>
-    </div>
-    <div class="actions actions-right" style="gap:10px;">
-      <a class="btn-ghost" href="/intake">Приём заявлений</a>
-      <a class="btn-ghost" href="/approve">Апрув заявлений</a>
+      <span class="brand-name">NefrLearn</span>
+    </a>
+    <nav class="main-nav">
+      <a href="/" class="nav-link active">Генератор</a>
+      <a href="/intake" class="nav-link">Приём заявлений</a>
+      <a href="/applications" class="nav-link">Заявления</a>
+      <a href="/approve" class="nav-link">Экспертная очередь</a>
+      <a href="/conclusions" class="nav-link">Заключения</a>
+    </nav>
+    <div class="topbar-end">
+      <button id="themeToggle" class="nav-theme-toggle" onclick="__toggleTheme()" title="Тёмная тема">🌙</button>
+      <a href="/admin" class="nav-admin" title="Adminка">⚙</a>
     </div>
   </header>
 

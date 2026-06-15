@@ -10,7 +10,7 @@ from typing import Any, Literal
 from syslog import log
 
 
-Status = Literal["pending_approval", "approved", "sent", "error"]
+Status = Literal["analyzing", "pending_approval", "approved", "sent", "error"]
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,7 @@ class RequestRow:
     analyze_json: dict[str, Any]
     edit_json: dict[str, Any] | None
     output_drive_file_id: str | None
+    local_file_path: str | None
     error: str | None
 
 
@@ -52,14 +53,21 @@ class QueueStore:
                     analyze_json TEXT NOT NULL,
                     edit_json TEXT NULL,
                     output_drive_file_id TEXT NULL,
+                    local_file_path TEXT NULL,
                     error TEXT NULL
                 )
                 """
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status)")
+            # Safe migration for existing databases
+            try:
+                conn.execute("ALTER TABLE requests ADD COLUMN local_file_path TEXT NULL")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         log(f"Очередь: БД {self.db_path}")
 
     def _row_to_request(self, r: sqlite3.Row) -> RequestRow:
+        keys = r.keys()
         return RequestRow(
             id=int(r["id"]),
             drive_file_id=str(r["drive_file_id"]),
@@ -70,20 +78,28 @@ class QueueStore:
             analyze_json=json.loads(r["analyze_json"]),
             edit_json=json.loads(r["edit_json"]) if r["edit_json"] else None,
             output_drive_file_id=str(r["output_drive_file_id"]) if r["output_drive_file_id"] else None,
+            local_file_path=str(r["local_file_path"]) if "local_file_path" in keys and r["local_file_path"] else None,
             error=str(r["error"]) if r["error"] else None,
         )
 
-    def upsert_pending(self, *, drive_file_id: str, filename: str, analyze_json: dict[str, Any]) -> RequestRow:
+    def upsert_pending(
+        self,
+        *,
+        drive_file_id: str,
+        filename: str,
+        analyze_json: dict[str, Any],
+        status: str = "analyzing",
+    ) -> RequestRow:
         now = int(time.time())
         payload = json.dumps(analyze_json, ensure_ascii=False)
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO requests(drive_file_id, filename, status, created_at, updated_at, analyze_json)
-                VALUES (?, ?, 'pending_approval', ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(drive_file_id) DO NOTHING
                 """,
-                (drive_file_id, filename, now, now, payload),
+                (drive_file_id, filename, status, now, now, payload),
             )
             row = conn.execute(
                 "SELECT * FROM requests WHERE drive_file_id = ?",
@@ -172,6 +188,18 @@ class QueueStore:
             log(f"Очередь: #{request_id} → pending_approval (повторное распознавание)")
             return self._row_to_request(row)
 
+    def mark_analyzing(self, request_id: int) -> RequestRow:
+        now = int(time.time())
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE requests SET status = 'analyzing', error = NULL, updated_at = ? WHERE id = ?",
+                (now, int(request_id)),
+            )
+            row = conn.execute("SELECT * FROM requests WHERE id = ?", (int(request_id),)).fetchone()
+            assert row is not None
+            log(f"Очередь: #{request_id} → analyzing")
+            return self._row_to_request(row)
+
     def mark_approved(self, request_id: int) -> RequestRow:
         now = int(time.time())
         with self._connect() as conn:
@@ -184,15 +212,28 @@ class QueueStore:
             log(f"Очередь: #{request_id} → approved")
             return self._row_to_request(row)
 
-    def mark_sent(self, request_id: int, *, output_drive_file_id: str | None) -> RequestRow:
+    def delete(self, request_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM requests WHERE id = ?", (int(request_id),))
+        log(f"Очередь: #{request_id} удалён")
+
+    def mark_sent(
+        self,
+        request_id: int,
+        *,
+        output_drive_file_id: str | None,
+        local_file_path: str | None = None,
+    ) -> RequestRow:
         now = int(time.time())
         with self._connect() as conn:
             conn.execute(
-                "UPDATE requests SET status = 'sent', output_drive_file_id = ?, updated_at = ? WHERE id = ?",
-                (output_drive_file_id, now, int(request_id)),
+                """UPDATE requests
+                   SET status = 'sent', output_drive_file_id = ?,
+                       local_file_path = ?, updated_at = ?
+                   WHERE id = ?""",
+                (output_drive_file_id, local_file_path, now, int(request_id)),
             )
             row = conn.execute("SELECT * FROM requests WHERE id = ?", (int(request_id),)).fetchone()
             assert row is not None
-            log(f"Очередь: #{request_id} → sent (drive_out={output_drive_file_id})")
+            log(f"Очередь: #{request_id} → sent (drive_out={output_drive_file_id}, local={local_file_path})")
             return self._row_to_request(row)
-

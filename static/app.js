@@ -211,15 +211,26 @@ analyzeBtn.addEventListener("click", async () => {
   if (!chosenFile) return;
   const fd = new FormData();
   fd.append("pdf", chosenFile);
-  const orKey = $("openrouterKey").value.trim();
-  const geminiKey = $("apiKey").value.trim();
-  if (orKey) fd.append("openrouter_api_key", orKey);
-  if (geminiKey) fd.append("gemini_api_key", geminiKey);
   fd.append("auto_map", "true");
 
   $("step-upload").classList.add("hidden");
   $("step-loading").classList.remove("hidden");
-  $("loadingText").textContent = `Распознаём документ (страниц: ?) — это занимает 30–90 сек…`;
+
+  const startedAt = Date.now();
+  const phases = [
+    "Читаем PDF и распознаём страницы…",
+    "Анализируем сертификаты через LLM…",
+    "Сопоставляем сертификаты с дисциплинами…",
+    "Финальная проверка…",
+  ];
+  let phaseIdx = 0;
+  const tick = () => {
+    const secs = Math.round((Date.now() - startedAt) / 1000);
+    const phase = phases[Math.min(phaseIdx, phases.length - 1)];
+    $("loadingText").textContent = `${phase} (${secs} сек)`;
+    phaseIdx++;
+  };
+  tick();
 
   try {
     const res = await fetch("/api/analyze", { method: "POST", body: fd });
@@ -227,10 +238,27 @@ analyzeBtn.addEventListener("click", async () => {
       const errText = (await res.json().catch(() => null))?.detail || res.statusText;
       throw new Error(errText);
     }
-    const data = await res.json();
+    const { job_id, request_id: queueRequestId } = await res.json();
+    if (!job_id) throw new Error("Сервер не вернул job_id");
+
+    // Поллинг каждые 2.5 сек
+    let data;
+    while (true) {
+      await new Promise(r => setTimeout(r, 2500));
+      tick();
+      const poll = await fetch(`/api/analyze/jobs/${encodeURIComponent(job_id)}`);
+      if (!poll.ok) throw new Error("Ошибка опроса сервера");
+      const job = await poll.json();
+      if (job.status === "done") { data = job.result; break; }
+      if (job.status === "error") throw new Error(job.error || "Ошибка анализа");
+    }
+
     populateFromAnalyze(data);
     $("step-loading").classList.add("hidden");
     $("step-editor").classList.remove("hidden");
+    if (queueRequestId && !activeRequestId) {
+      activeRequestId = queueRequestId;
+    }
     if (Array.isArray(data.errors) && data.errors.length) {
       toast(`Распознано с замечаниями (${data.errors.length}): ${data.errors[0]}`, "error");
       console.warn("Analyze warnings:", data.errors);
@@ -275,18 +303,19 @@ function showQueueDriveLink(data) {
   const head = document.querySelector("#step-editor .step-head");
   if (!head) return;
   head.querySelector(".queue-drive-link")?.remove();
-  const url = data.drive_file_url || (
-    data.drive_file_id
-      ? `https://drive.google.com/file/d/${encodeURIComponent(data.drive_file_id)}/view`
-      : ""
-  );
-  if (!url) return;
+  // Ссылка на локальный PDF (только для загруженных вручную)
+  const rid = data.id || activeRequestId;
+  const fid = data.drive_file_id || "";
+  if (!rid || (!fid.startsWith("upload_") && !fid.startsWith("intake_"))) return;
+  const url = fid.startsWith("intake_")
+    ? `/api/intake/applications/${fid.replace("intake_", "")}/pdf`
+    : `/api/requests/${rid}/pdf`;
   const a = document.createElement("a");
   a.className = "queue-drive-link";
   a.href = url;
   a.target = "_blank";
   a.rel = "noopener noreferrer";
-  a.textContent = "Исходный PDF на Google Drive";
+  a.textContent = "Исходный PDF";
   head.appendChild(a);
 }
 
@@ -370,12 +399,12 @@ function injectApproveControls() {
   reanalyzeBtn.addEventListener("click", async () => {
     if (!activeRequestId) return;
     if (!confirm(
-      "Заново распознать PDF с Google Drive?\n\nТекущие правки в форме будут заменены (30–90 сек)."
+      "Заново распознать PDF?\n\nТекущие правки в форме будут заменены (30–90 сек)."
     )) return;
     reanalyzeBtn.disabled = true;
     $("step-editor").classList.add("hidden");
     $("step-loading").classList.remove("hidden");
-    $("loadingText").textContent = "Повторное распознавание PDF с Drive…";
+    $("loadingText").textContent = "Повторное распознавание PDF…";
     try {
       const res = await fetch(
         `/api/requests/${encodeURIComponent(activeRequestId)}/reanalyze`,
@@ -419,7 +448,7 @@ function injectApproveControls() {
 
   const approveBtn = document.createElement("button");
   approveBtn.className = "btn-primary";
-  approveBtn.textContent = "Апрув + отправить в Drive";
+  approveBtn.textContent = "Утвердить + сохранить";
   approveBtn.addEventListener("click", async () => {
     try {
       await saveQueueEditState();
@@ -427,10 +456,10 @@ function injectApproveControls() {
         method: "POST",
       });
       if (!res.ok) throw new Error(await res.text());
-      toast("Отправлено в Google Drive", "success");
+      toast("Заключение сохранено", "success");
       setTimeout(() => (location.href = "/approve"), 700);
     } catch (e) {
-      toast("Ошибка апрува: " + e.message, "error");
+      toast("Ошибка утверждения: " + e.message, "error");
     }
   });
 
@@ -452,15 +481,19 @@ function populateFromAnalyze(data) {
   $("fProgram").value = state.student.program_code;
   $("fYear").value = state.student.course_year;
 
-  state.disciplines = (data.disciplines || []).map(d => ({
-    name: d,
-    plan_credits: "5",
-    total_hours: "",
-    grade_points: "",
-    compliance: "полное",
-    note: "",
-    final_grade: "",
-  }));
+  const planData = data.plan_data || {};
+  state.disciplines = (data.disciplines || []).map(d => {
+    const pd = planData[d] || {};
+    return {
+      name: d,
+      plan_credits: pd.credits ? String(pd.credits) : "5",
+      total_hours: pd.lec != null ? String((pd.lec || 0) + (pd.prac || 0) + (pd.lab || 0)) : "",
+      grade_points: "",
+      compliance: "полное",
+      note: "",
+      final_grade: "",
+    };
+  });
   state.certificates = (data.certificates || []).map(c => ({
     ...c,
     _bound: null,
@@ -559,10 +592,12 @@ function renderDisciplines() {
     const block = document.createElement("div");
     block.className = "discipline";
     block.dataset.idx = i;
+    const creditsLabel = d.plan_credits ? `${escapeHtml(d.plan_credits)} кред.` : "? кред.";
     block.innerHTML = `
       <div class="discipline-head">
         <span class="idx">${i + 1}</span>
         <input class="disc-name" type="text" value="${escapeAttr(d.name)}" placeholder="Название дисциплины">
+        <span class="credits-badge" data-credits-badge>${creditsLabel}</span>
         <button class="btn-danger-ghost" data-act="del">Удалить</button>
       </div>
       <div class="discipline-fields">
@@ -582,6 +617,10 @@ function renderDisciplines() {
     block.querySelectorAll(".discipline-fields [data-f]").forEach(inp => {
       inp.addEventListener("input", e => {
         state.disciplines[i][inp.dataset.f] = e.target.value;
+        if (inp.dataset.f === "plan_credits") {
+          const badge = block.querySelector("[data-credits-badge]");
+          if (badge) badge.textContent = (e.target.value || "?") + " кред.";
+        }
       });
     });
     block.querySelector('[data-act="del"]').addEventListener("click", () => {
@@ -681,14 +720,23 @@ $("generateBtn").addEventListener("click", async () => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     const dispo = res.headers.get("Content-Disposition") || "";
-    const m = dispo.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/);
+    const mStar = dispo.match(/filename\*=(?:utf-8|UTF-8)''([^;\s]+)/i);
+    const mPlain = dispo.match(/filename="?([^";]+)"?/i);
     a.href = url;
-    a.download = m ? decodeURIComponent(m[1]) : "report.docx";
+    a.download = mStar ? decodeURIComponent(mStar[1]) : mPlain ? mPlain[1] : "Заключение.docx";
     document.body.appendChild(a);
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
     toast("Документ создан", "success");
+
+    // Если заявление в очереди — тихо сохраняем заключение на сервере
+    if (activeRequestId) {
+      try {
+        await saveQueueEditState();
+        await fetch(`/api/requests/${encodeURIComponent(activeRequestId)}/approve`, { method: "POST" });
+      } catch (_) {}
+    }
   } catch (e) {
     toast("Ошибка генерации: " + e.message, "error");
   }
@@ -709,18 +757,6 @@ function escapeHtml(s) {
     .replace(/'/g, "&#39;");
 }
 function escapeAttr(s) { return escapeHtml(s); }
-
-// Восстанавливаем ключи из localStorage
-const savedGemini = localStorage.getItem("gemini_key");
-if (savedGemini) $("apiKey").value = savedGemini;
-$("apiKey").addEventListener("change", () => {
-  localStorage.setItem("gemini_key", $("apiKey").value.trim());
-});
-const savedOR = localStorage.getItem("openrouter_key");
-if (savedOR) $("openrouterKey").value = savedOR;
-$("openrouterKey").addEventListener("change", () => {
-  localStorage.setItem("openrouter_key", $("openrouterKey").value.trim());
-});
 
 // init
 maybeLoadFromQueue();

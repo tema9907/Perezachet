@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Экспертные заключения</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link id="favicon" rel="icon" type="image/x-icon" href="/static/favicon.ico">
+  <script src="/static/theme.js"></script>
+  <style>
+    .conc-grid { display: grid; gap: 12px; }
+    .conc-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      transition: box-shadow .15s;
+    }
+    .conc-card:hover { box-shadow: 0 2px 12px rgba(0,0,0,.08); }
+    .conc-card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .conc-card-title { font-weight: 600; font-size: 15px; color: var(--text); }
+    .conc-card-meta { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; color: var(--muted); }
+    .conc-card-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
+    .pill-sent { background: #dcfce7; color: #166534; }
+    [data-theme="dark"] .pill-sent { background: #052e16; color: #6ee7b7; }
+    .source-tag {
+      display: inline-block;
+      background: var(--primary-soft, #eff6ff);
+      color: var(--primary, #2563eb);
+      border-radius: 6px;
+      padding: 2px 8px;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">
+      <span class="logo">ЭЗ</span>
+      <span class="brand-name">NefrLearn</span>
+    </a>
+    <nav class="main-nav">
+      <a href="/" class="nav-link">Генератор</a>
+      <a href="/intake" class="nav-link">Приём заявлений</a>
+      <a href="/applications" class="nav-link">Заявления</a>
+      <a href="/approve" class="nav-link">Экспертная очередь</a>
+      <a href="/conclusions" class="nav-link active">Заключения</a>
+    </nav>
+    <div class="topbar-end">
+      <button id="refreshBtn" class="btn-primary" style="padding:7px 14px;font-size:13px;">Обновить</button>
+      <button id="themeToggle" class="nav-theme-toggle" onclick="__toggleTheme()" title="Тёмная тема">🌙</button>
+      <a href="/admin" class="nav-admin" title="Adminка">⚙</a>
+    </div>
+  </header>
+
+  <main>
+    <section class="card">
+      <div class="step-head">
+        <span class="step-num">✓</span>
+        <h2>Готовые заключения</h2>
+      </div>
+      <p class="hint">Все экспертные заключения, которые были утверждены и сохранены. Доступны для скачивания напрямую с сервера.</p>
+
+      <div id="concList" class="conc-grid"></div>
+      <div id="emptyState" class="meta hidden" style="padding:24px 0;text-align:center;">
+        Пока нет ни одного готового заключения.
+        <a href="/approve">Перейти в экспертную очередь →</a>
+      </div>
+    </section>
+
+    <div id="toast" class="toast hidden"></div>
+  </main>
+
+  <script src="/static/conclusions.js"></script>
+</body>
+</html>

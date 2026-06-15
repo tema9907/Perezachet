@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Adminка — NefrLearn</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,sans-serif;background:#f1f5f9;color:#1e293b;font-size:14px}
+a{color:#3b82f6;text-decoration:none}
+
+/* Login */
+#loginWrap{display:flex;align-items:center;justify-content:center;min-height:100vh}
+.login-card{background:#fff;border-radius:12px;padding:36px 40px;box-shadow:0 4px 24px #0001;width:340px}
+.login-card h1{font-size:20px;margin-bottom:24px;font-weight:700}
+.form-group{margin-bottom:16px}
+.form-group label{display:block;font-size:12px;font-weight:600;color:#64748b;margin-bottom:5px;text-transform:uppercase;letter-spacing:.5px}
+.form-group input{width:100%;padding:9px 12px;border:1.5px solid #e2e8f0;border-radius:8px;font-size:14px;outline:none;transition:border .15s}
+.form-group input:focus{border-color:#3b82f6}
+.btn-primary{width:100%;padding:10px;background:#3b82f6;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:background .15s}
+.btn-primary:hover{background:#2563eb}
+.err{color:#dc2626;font-size:13px;margin-top:10px;display:none}
+
+/* Dashboard */
+#dashWrap{display:none;min-height:100vh}
+.top-bar{background:#fff;border-bottom:1px solid #e2e8f0;padding:0 24px;display:flex;align-items:center;gap:16px;height:52px}
+.top-bar h1{font-size:16px;font-weight:700;flex:1}
+.top-bar button{padding:6px 14px;border-radius:7px;border:1.5px solid #e2e8f0;background:#fff;cursor:pointer;font-size:13px;font-weight:500}
+.top-bar button:hover{background:#f8fafc}
+
+.main{padding:24px;max-width:1400px;margin:0 auto}
+.section{background:#fff;border-radius:12px;border:1px solid #e2e8f0;margin-bottom:24px;overflow:hidden}
+.section-header{padding:14px 20px;border-bottom:1px solid #f1f5f9;display:flex;align-items:center;gap:10px}
+.section-header h2{font-size:15px;font-weight:700;flex:1}
+.section-header button{padding:5px 12px;border-radius:6px;border:1.5px solid #e2e8f0;background:#fff;cursor:pointer;font-size:12px;font-weight:500}
+.section-header button:hover{background:#f1f5f9}
+
+table{width:100%;border-collapse:collapse}
+th{padding:9px 14px;text-align:left;font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.4px;background:#f8fafc;border-bottom:1px solid #e2e8f0}
+td{padding:10px 14px;border-bottom:1px solid #f8fafc;vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#f8fafc}
+
+.pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:11px;font-weight:600}
+.pill-created{background:#f0fdf4;color:#16a34a}
+.pill-in_review{background:#eff6ff;color:#2563eb}
+.pill-done{background:#f0fdf4;color:#15803d}
+.pill-pending_approval{background:#fefce8;color:#ca8a04}
+.pill-sent{background:#f0fdf4;color:#16a34a}
+.pill-error{background:#fef2f2;color:#dc2626}
+.pill-approved{background:#f5f3ff;color:#7c3aed}
+
+.actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+select{padding:5px 8px;border:1.5px solid #e2e8f0;border-radius:6px;font-size:13px;outline:none;cursor:pointer}
+select:focus{border-color:#3b82f6}
+.btn-sm{padding:5px 12px;border-radius:6px;border:none;font-size:12px;font-weight:600;cursor:pointer;transition:background .15s}
+.btn-apply{background:#3b82f6;color:#fff}.btn-apply:hover{background:#2563eb}
+.btn-del{background:#fef2f2;color:#dc2626;border:1.5px solid #fecaca}.btn-del:hover{background:#fee2e2}
+.del-q-wrap{display:flex;align-items:center;gap:4px;font-size:12px;color:#64748b}
+
+.toast{position:fixed;bottom:24px;right:24px;padding:10px 18px;border-radius:8px;font-size:13px;font-weight:500;background:#1e293b;color:#fff;opacity:0;transition:opacity .2s;pointer-events:none;z-index:999}
+.toast.show{opacity:1}
+.toast.ok{background:#16a34a}
+.toast.err{background:#dc2626}
+
+.empty{padding:40px;text-align:center;color:#94a3b8;font-size:13px}
+.meta{font-size:11px;color:#94a3b8}
+</style>
+</head>
+<body>
+
+<!-- Login -->
+<div id="loginWrap">
+  <div class="login-card">
+    <h1>🔐 Adminка</h1>
+    <div class="form-group">
+      <label>Логин</label>
+      <input type="text" id="uname" value="admin" autocomplete="username">
+    </div>
+    <div class="form-group">
+      <label>Пароль</label>
+      <input type="password" id="upass" autocomplete="current-password">
+    </div>
+    <button class="btn-primary" onclick="doLogin()">Войти</button>
+    <div class="err" id="loginErr"></div>
+  </div>
+</div>
+
+<!-- Dashboard -->
+<div id="dashWrap">
+  <div class="top-bar">
+    <h1>NefrLearn — Adminка</h1>
+    <button onclick="loadAll()">↻ Обновить</button>
+    <button onclick="doLogout()">Выйти</button>
+  </div>
+
+  <div class="main">
+    <!-- Intake apps -->
+    <div class="section">
+      <div class="section-header">
+        <h2>Заявления студентов (intake)</h2>
+        <button onclick="loadApps()">↻</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Студент</th>
+            <th>Группа / Курс</th>
+            <th>Статус</th>
+            <th>Queue ID</th>
+            <th>Дата</th>
+            <th>Действия</th>
+          </tr>
+        </thead>
+        <tbody id="appsBody"><tr><td colspan="7" class="empty">Загрузка…</td></tr></tbody>
+      </table>
+    </div>
+
+    <!-- Queue entries -->
+    <div class="section">
+      <div class="section-header">
+        <h2>Очередь экспертизы (queue)</h2>
+        <button onclick="loadQueue()">↻</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Файл</th>
+            <th>Студент</th>
+            <th>Статус</th>
+            <th>Intake ID</th>
+            <th>Дата</th>
+            <th>Действия</th>
+          </tr>
+        </thead>
+        <tbody id="queueBody"><tr><td colspan="7" class="empty">Загрузка…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const STATUS_OPTS_APP = ["created","in_review","done"];
+const STATUS_LABELS_APP = {created:"Создано",in_review:"На экспертизе",done:"Готово"};
+const STATUS_PILLS_APP = {created:"pill-created",in_review:"pill-in_review",done:"pill-done"};
+
+const STATUS_LABELS_Q = {
+  pending_approval:"Ожидает",approved:"Формируется",
+  sent:"Готово",error:"Ошибка"
+};
+const STATUS_PILLS_Q = {
+  pending_approval:"pill-pending_approval",approved:"pill-approved",
+  sent:"pill-sent",error:"pill-error"
+};
+
+function toast(msg, kind="") {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.className = "toast show" + (kind ? " "+kind : "");
+  setTimeout(() => t.className="toast", 3000);
+}
+
+function fmtDate(ts) {
+  if (!ts) return "—";
+  const d = new Date(ts*1000);
+  return d.toLocaleDateString("ru-RU")+" "+d.toLocaleTimeString("ru-RU",{hour:"2-digit",minute:"2-digit"});
+}
+
+function esc(s) {
+  return String(s??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+// ---- Auth ----
+async function checkAuth() {
+  const r = await fetch("/admin/api/me");
+  const d = await r.json();
+  if (d.logged_in) showDash();
+}
+
+async function doLogin() {
+  const u = document.getElementById("uname").value;
+  const p = document.getElementById("upass").value;
+  const errEl = document.getElementById("loginErr");
+  errEl.style.display = "none";
+  const fd = new FormData();
+  fd.append("username", u);
+  fd.append("password", p);
+  try {
+    const r = await fetch("/admin/login", {method:"POST", body:fd});
+    if (!r.ok) {
+      const d = await r.json().catch(()=>({detail:"Ошибка"}));
+      errEl.textContent = d.detail || "Ошибка";
+      errEl.style.display = "block";
+      return;
+    }
+    showDash();
+  } catch(e) {
+    errEl.textContent = "Сетевая ошибка: "+e.message;
+    errEl.style.display = "block";
+  }
+}
+
+async function doLogout() {
+  await fetch("/admin/logout", {method:"POST"});
+  document.getElementById("dashWrap").style.display = "none";
+  document.getElementById("loginWrap").style.display = "flex";
+  document.getElementById("upass").value = "";
+}
+
+function showDash() {
+  document.getElementById("loginWrap").style.display = "none";
+  document.getElementById("dashWrap").style.display = "block";
+  loadAll();
+}
+
+function loadAll() { loadApps(); loadQueue(); }
+
+// ---- Intake apps ----
+async function loadApps() {
+  const tbody = document.getElementById("appsBody");
+  tbody.innerHTML = '<tr><td colspan="7" class="empty">Загрузка…</td></tr>';
+  try {
+    const r = await fetch("/admin/api/apps");
+    if (r.status === 401) { doLogout(); return; }
+    const d = await r.json();
+    renderApps(d.items || []);
+  } catch(e) {
+    tbody.innerHTML = `<tr><td colspan="7" class="empty">Ошибка: ${esc(e.message)}</td></tr>`;
+  }
+}
+
+function renderApps(items) {
+  const tbody = document.getElementById("appsBody");
+  if (!items.length) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">Нет заявлений</td></tr>';
+    return;
+  }
+  tbody.innerHTML = items.map(a => {
+    const pill = STATUS_PILLS_APP[a.status] || "pill-created";
+    const label = STATUS_LABELS_APP[a.status] || a.status;
+    const opts = STATUS_OPTS_APP.map(s =>
+      `<option value="${s}"${s===a.status?" selected":""}>${STATUS_LABELS_APP[s]||s}</option>`
+    ).join("");
+    const hasQueue = a.queue_request_id != null;
+    return `<tr>
+      <td class="meta">#${a.id}</td>
+      <td>
+        <div style="font-weight:600">${esc(a.student_name||"—")}</div>
+        <div class="meta">${esc(a.faculty||"")} ${a.department?"· "+esc(a.department):""}</div>
+      </td>
+      <td><div>${esc(a.group_name||"—")}</div><div class="meta">${esc(a.course_year||"")} курс</div></td>
+      <td><span class="pill ${pill}">${esc(label)}</span></td>
+      <td class="meta">${hasQueue?`<a href="/approve" target="_blank">#${a.queue_request_id}</a>`:"—"}</td>
+      <td class="meta">${fmtDate(a.created_at)}</td>
+      <td>
+        <div class="actions">
+          <select id="sel-app-${a.id}">${opts}</select>
+          ${hasQueue?`<label class="del-q-wrap"><input type="checkbox" id="delq-${a.id}"> удалить queue</label>`:""}
+          <button class="btn-sm btn-apply" onclick="applyAppStatus(${a.id})">Применить</button>
+        </div>
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+async function applyAppStatus(id) {
+  const sel = document.getElementById("sel-app-"+id);
+  const delq = document.getElementById("delq-"+id);
+  const status = sel.value;
+  const delete_queue = delq ? delq.checked : false;
+  try {
+    const r = await fetch(`/admin/api/apps/${id}/status`, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({status, delete_queue}),
+    });
+    if (!r.ok) throw new Error((await r.json().catch(()=>({detail:"Ошибка"}))).detail);
+    toast(`Заявление #${id} → ${status}`, "ok");
+    loadApps();
+    if (delete_queue) loadQueue();
+  } catch(e) {
+    toast("Ошибка: "+e.message, "err");
+  }
+}
+
+// ---- Queue ----
+async function loadQueue() {
+  const tbody = document.getElementById("queueBody");
+  tbody.innerHTML = '<tr><td colspan="7" class="empty">Загрузка…</td></tr>';
+  try {
+    const r = await fetch("/admin/api/queue");
+    if (r.status === 401) { doLogout(); return; }
+    const d = await r.json();
+    renderQueue(d.items || []);
+  } catch(e) {
+    tbody.innerHTML = `<tr><td colspan="7" class="empty">Ошибка: ${esc(e.message)}</td></tr>`;
+  }
+}
+
+function renderQueue(items) {
+  const tbody = document.getElementById("queueBody");
+  if (!items.length) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">Очередь пуста</td></tr>';
+    return;
+  }
+  tbody.innerHTML = items.map(r => {
+    const pill = STATUS_PILLS_Q[r.status] || "";
+    const label = STATUS_LABELS_Q[r.status] || r.status;
+    const isUpload = r.drive_file_id && r.drive_file_id.startsWith("upload_");
+    const isIntake = r.drive_file_id && r.drive_file_id.startsWith("intake_");
+    const pdfLink = isUpload
+      ? `<a href="/api/requests/${r.id}/pdf" target="_blank">PDF</a>`
+      : "";
+    return `<tr>
+      <td class="meta">#${r.id}</td>
+      <td>
+        <div>${esc(r.filename||"—")}</div>
+        ${pdfLink?`<div class="meta">${pdfLink}</div>`:""}
+        ${r.error?`<div class="meta" style="color:#dc2626" title="${esc(r.error)}">${esc(r.error.slice(0,60))}</div>`:""}
+      </td>
+      <td>${esc(r.student_name||"—")}</td>
+      <td><span class="pill ${pill}">${esc(label)}</span></td>
+      <td class="meta">${r.intake_app_id!=null?`#${r.intake_app_id}`:"—"}</td>
+      <td class="meta">${fmtDate(r.created_at)}</td>
+      <td>
+        <button class="btn-sm btn-del" onclick="deleteQueue(${r.id})">Удалить</button>
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+async function deleteQueue(id) {
+  if (!confirm(`Удалить запись очереди #${id}?`)) return;
+  try {
+    const r = await fetch(`/admin/api/queue/${id}`, {method:"DELETE"});
+    if (!r.ok) throw new Error((await r.json().catch(()=>({detail:"Ошибка"}))).detail);
+    toast(`Queue #${id} удалён`, "ok");
+    loadQueue();
+  } catch(e) {
+    toast("Ошибка: "+e.message, "err");
+  }
+}
+
+// Enter to login
+document.getElementById("upass").addEventListener("keydown", e => {
+  if (e.key === "Enter") doLogin();
+});
+
+// Check auth on load
+checkAuth();
+</script>
+</body>
+</html>

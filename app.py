@@ -4,11 +4,14 @@ FastAPI приложение: загрузка PDF -> анализ -> предп
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import re
+import secrets
 import time
 import traceback
 import urllib.parse
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -20,21 +23,17 @@ except ImportError:
 
 import json
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi import Cookie, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import analyzer
 import application_generator
 import doc_generator
-from drive_client import DriveClient
+from intake_store import IntakeStore
 from queue_store import QueueStore
 from syslog import log
-
-INTAKE_FOLDER_ID = os.environ.get(
-    "DRIVE_INTAKE_FOLDER_ID", "10hRhC-6SM3ucGCqiTXcbUcigbq-yVhQz"
-).strip()
 
 app = FastAPI(title="Экспертное заключение — генератор")
 
@@ -43,30 +42,18 @@ STATIC_DIR.mkdir(exist_ok=True)
 
 DATA_DIR = Path(__file__).parent / ".data"
 STORE = QueueStore(DATA_DIR / "queue.sqlite3")
+INTAKE_STORE = IntakeStore(DATA_DIR / "intake.sqlite3")
 
-_drive: DriveClient | None = None
-_poll_task: asyncio.Task | None = None
+CONCLUSIONS_DIR = DATA_DIR / "conclusions"
+APPLICATIONS_DIR = DATA_DIR / "applications"
+CONCLUSIONS_DIR.mkdir(parents=True, exist_ok=True)
+APPLICATIONS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Последний статус Drive (для логов и /api/health)
-_drive_status: dict[str, Any] = {
-    "enabled": False,
-    "configured": False,
-    "connected": False,
-    "service_account_email": "",
-    "input_folder_id": "",
-    "output_folder_id": "",
-    "last_check_at": None,
-    "last_check_message": "",
-    "last_poll_at": None,
-    "last_poll_ok": None,
-    "last_poll_message": "",
-    "last_error": None,
-    "output_connected": False,
-    "output_shared_drive": False,
-    "output_check_message": "",
-    "upload_auth": "",
-    "oauth_token_ready": False,
-}
+# In-memory job store for async PDF analysis
+_analyze_jobs: dict[str, dict] = {}
+
+# SSE clients: one asyncio.Queue per connected browser tab
+_sse_clients: list[asyncio.Queue] = []
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +82,7 @@ class AnalyzeResponse(BaseModel):
     certificates: list[CertOut] = Field(default_factory=list)
     mapping: dict[str, int] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
+    plan_data: dict[str, dict] = Field(default_factory=dict)
 
 
 class CourseIn(BaseModel):
@@ -131,9 +119,42 @@ class QueueEditState(BaseModel):
 
 def drive_file_view_url(drive_file_id: str) -> str:
     fid = (drive_file_id or "").strip()
-    if not fid:
+    if not fid or fid.startswith("intake_") or fid.startswith("upload_"):
         return ""
     return f"https://drive.google.com/file/d/{fid}/view"
+
+
+def _row_to_sse_dict(r: "RequestRow") -> dict:
+    a = r.analyze_json or {}
+    return {
+        "id": r.id,
+        "status": r.status,
+        "drive_file_id": r.drive_file_id,
+        "filename": r.filename,
+        "student_name": a.get("student_name") or "",
+        "group": a.get("group") or "",
+        "faculty": a.get("faculty") or "",
+        "department": a.get("department") or "",
+        "created_at": r.created_at,
+        "updated_at": r.updated_at,
+        "drive_file_url": drive_file_view_url(r.drive_file_id),
+        "output_drive_file_id": r.output_drive_file_id or "",
+        "error": r.error or "",
+    }
+
+
+def _broadcast_sse(event: dict) -> None:
+    dead = []
+    for q in _sse_clients:
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            dead.append(q)
+    for q in dead:
+        try:
+            _sse_clients.remove(q)
+        except ValueError:
+            pass
 
 
 class QueueListItem(BaseModel):
@@ -143,8 +164,13 @@ class QueueListItem(BaseModel):
     status: str
     student_name: str = ""
     group: str = ""
+    faculty: str = ""
+    department: str = ""
+    created_at: int = 0
     updated_at: int
     drive_file_url: str = ""
+    output_drive_file_id: str = ""
+    error: str = ""
 
 
 class QueueListResponse(BaseModel):
@@ -256,63 +282,152 @@ def _run_pdf_analysis(pdf_bytes: bytes) -> tuple[dict[str, Any], dict[str, Any]]
     return _result_to_queue_payload(result, mapping)
 
 
-@app.post("/api/analyze", response_model=AnalyzeResponse)
-async def analyze(
+async def _run_pdf_analysis_async(pdf_bytes: bytes) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Запускает синхронный _run_pdf_analysis в пуле потоков, не блокируя event loop."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _run_pdf_analysis, pdf_bytes)
+
+
+async def _do_analyze_job(job_id: str, pdf_bytes: bytes, auto_map: bool) -> None:
+    """Фоновая задача анализа PDF: результат сохраняется в _analyze_jobs[job_id]."""
+    loop = asyncio.get_event_loop()
+    try:
+        gemini_key, openrouter_key = _env_llm_keys()
+        if not (gemini_key or openrouter_key):
+            raise RuntimeError("Не задан GEMINI_API_KEY или OPENROUTER_API_KEY")
+
+        result = await loop.run_in_executor(
+            None,
+            lambda: analyzer.analyze_pdf(
+                pdf_bytes,
+                gemini_api_key=gemini_key,
+                openrouter_api_key=openrouter_key,
+            ),
+        )
+
+        mapping: dict[int, int] = {}
+        if auto_map and result.application.disciplines and result.certificates:
+            try:
+                mapping = await loop.run_in_executor(
+                    None,
+                    lambda: analyzer.suggest_mapping(
+                        result,
+                        gemini_api_key=gemini_key,
+                        openrouter_api_key=openrouter_key,
+                    ),
+                )
+            except Exception:
+                pass
+
+        response = AnalyzeResponse(
+            student_name=result.application.student_name,
+            group=result.application.group,
+            program_code=doc_generator.derive_program(result.application.group),
+            course_year=result.application.course_year,
+            phone=result.application.phone,
+            application_date=result.application.application_date,
+            disciplines=result.application.disciplines,
+            certificates=[
+                CertOut(**{k: getattr(c, k) for k in CertOut.model_fields})
+                for c in result.certificates
+            ],
+            mapping={str(k): v for k, v in mapping.items()},
+            errors=result.errors,
+            plan_data=result.application.plan_data or {},
+        )
+        _analyze_jobs[job_id].update({"status": "done", "result": response.model_dump()})
+        log(f"Analyze job {job_id}: готово — {result.application.student_name or '—'}")
+        # Если была создана запись в очереди — заполняем её данными анализа
+        job_meta = _analyze_jobs.get(job_id, {})
+        req_id = job_meta.get("request_id")
+        if req_id:
+            try:
+                queue_analyze, queue_edit = _result_to_queue_payload(result, mapping)
+                local_pdf = job_meta.get("local_pdf_path", "")
+                if local_pdf:
+                    queue_analyze["local_pdf_path"] = local_pdf
+                STORE.update_analyze(req_id, queue_analyze)
+                STORE.save_edit(req_id, queue_edit)
+                row = STORE.reset_pending(req_id)
+                _broadcast_sse({"type": "updated", **_row_to_sse_dict(row)})
+            except Exception as _qe:
+                log(f"Analyze job {job_id}: ошибка обновления очереди #{req_id} — {_qe}")
+    except Exception as e:
+        log(f"Analyze job {job_id}: ошибка — {e}")
+        _analyze_jobs[job_id].update({"status": "error", "error": str(e)})
+        req_id = _analyze_jobs.get(job_id, {}).get("request_id")
+        if req_id:
+            try:
+                row = STORE.mark_error(req_id, str(e))
+                _broadcast_sse({"type": "updated", **_row_to_sse_dict(row)})
+            except Exception:
+                pass
+
+
+@app.post("/api/analyze")
+async def analyze_submit(
     pdf: UploadFile = File(...),
-    api_key: str | None = Form(None),               # back-compat: Gemini
-    gemini_api_key: str | None = Form(None),
-    openrouter_api_key: str | None = Form(None),
     auto_map: bool = Form(True),
 ):
+    """Принимает PDF, немедленно возвращает job_id, анализ идёт в фоне."""
     if not pdf.filename or not pdf.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Файл должен быть .pdf")
-    log(f"API /analyze: файл «{pdf.filename}», auto_map={auto_map}")
-    gemini_key, openrouter_key = _resolve_keys(
-        gemini_api_key or api_key, openrouter_api_key
-    )
     pdf_bytes = await pdf.read()
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="Пустой PDF")
-    log(f"API /analyze: PDF {len(pdf_bytes)} байт, запуск распознавания…")
+    job_id = uuid.uuid4().hex[:10]
+
+    # Сохраняем PDF локально и создаём запись в очереди
+    upload_id = uuid.uuid4().hex[:12]
+    local_pdf_path = APPLICATIONS_DIR / f"upload_{upload_id}.pdf"
+    request_id: int | None = None
     try:
-        result = analyzer.analyze_pdf(
-            pdf_bytes,
-            gemini_api_key=gemini_key,
-            openrouter_api_key=openrouter_key,
+        local_pdf_path.write_bytes(pdf_bytes)
+        safe_filename = (pdf.filename or f"upload_{upload_id}.pdf")
+        row = STORE.upsert_pending(
+            drive_file_id=f"upload_{upload_id}",
+            filename=safe_filename,
+            analyze_json={
+                "student_name": "", "group": "", "program_code": "", "course_year": "",
+                "phone": "", "application_date": "", "disciplines": [], "certificates": [],
+                "mapping": {}, "errors": [], "plan_data": {},
+                "local_pdf_path": str(local_pdf_path),
+            },
+            status="analyzing",
         )
-    except Exception as e:
-        log(f"API /analyze: ошибка — {e}")
-        raise HTTPException(status_code=500, detail=f"Ошибка анализа: {e}")
+        request_id = row.id
+        _broadcast_sse({"type": "added", **_row_to_sse_dict(row)})
+        log(f"API /analyze: PDF сохранён → {local_pdf_path}, queue #{request_id}")
+    except Exception as _ex:
+        log(f"API /analyze: не удалось создать запись в очереди — {_ex}")
 
-    mapping: dict[int, int] = {}
-    if auto_map and result.application.disciplines and result.certificates:
-        log("API /analyze: авто-сопоставление курсов…")
-        try:
-            mapping = analyzer.suggest_mapping(
-                result,
-                gemini_api_key=gemini_key,
-                openrouter_api_key=openrouter_key,
-            )
-        except Exception as ex:
-            log(f"API /analyze: сопоставление не удалось — {ex}")
-            mapping = {}
+    _analyze_jobs[job_id] = {
+        "status": "running",
+        "result": None,
+        "error": None,
+        "started_at": time.time(),
+        "request_id": request_id,
+        "local_pdf_path": str(local_pdf_path) if request_id else None,
+    }
+    asyncio.create_task(_do_analyze_job(job_id, pdf_bytes, bool(auto_map)))
+    log(f"API /analyze: job {job_id} запущен, PDF {len(pdf_bytes)} байт")
+    return {"job_id": job_id, "request_id": request_id}
 
-    log(
-        f"API /analyze: готово — {result.application.student_name or '—'}, "
-        f"дисциплин={len(result.application.disciplines)}, сертификатов={len(result.certificates)}"
-    )
-    return AnalyzeResponse(
-        student_name=result.application.student_name,
-        group=result.application.group,
-        program_code=doc_generator.derive_program(result.application.group),
-        course_year=result.application.course_year,
-        phone=result.application.phone,
-        application_date=result.application.application_date,
-        disciplines=result.application.disciplines,
-        certificates=[CertOut(**{k: getattr(c, k) for k in CertOut.model_fields}) for c in result.certificates],
-        mapping={str(k): v for k, v in mapping.items()},
-        errors=result.errors,
-    )
+
+@app.get("/api/analyze/jobs/{job_id}")
+async def analyze_job_status(job_id: str):
+    """Статус и результат задачи анализа PDF."""
+    job = _analyze_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    elapsed = round(time.time() - job.get("started_at", time.time()), 1)
+    return {
+        "status": job["status"],
+        "result": job.get("result"),
+        "error": job.get("error"),
+        "elapsed": elapsed,
+        "request_id": job.get("request_id"),
+    }
 
 
 @app.post("/api/generate")
@@ -347,7 +462,7 @@ async def generate(req: GenerateRequest):
     )
     data = doc_generator.build_report(payload)
     safe_name = re.sub(r"[^\w\-]+", "_", req.student_name) or "report"
-    filename = f"ЭЗ_{safe_name}.docx"
+    filename = f"Заключение_{safe_name}.docx"
     log(f"API /generate: DOCX {len(data)} байт → «{filename}»")
     encoded_filename = urllib.parse.quote(filename)
     return Response(
@@ -368,7 +483,6 @@ async def health():
         "has_openrouter_key": bool(os.environ.get("OPENROUTER_API_KEY")),
         "gemini_model": analyzer.GEMINI_MODEL,
         "openrouter_models": analyzer.OPENROUTER_MODELS,
-        "drive": dict(_drive_status),
         "queue_pending": len(STORE.list(status="pending_approval", limit=500)),
     }
 
@@ -387,6 +501,36 @@ async def approve_page():
     return FileResponse(str(STATIC_DIR / "approve.html"))
 
 
+@app.get("/api/queue/stream")
+async def queue_sse_stream():
+    """SSE: пушит обновления статусов очереди всем подключённым клиентам."""
+    q: asyncio.Queue = asyncio.Queue(maxsize=100)
+    _sse_clients.append(q)
+
+    async def event_gen():
+        try:
+            yield 'data: {"type":"connected"}\n\n'
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=20.0)
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                except asyncio.TimeoutError:
+                    yield 'data: {"type":"heartbeat"}\n\n'
+        except asyncio.CancelledError:
+            pass
+        finally:
+            try:
+                _sse_clients.remove(q)
+            except ValueError:
+                pass
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/api/requests", response_model=QueueListResponse)
 async def list_requests():
     rows = STORE.list(limit=300)
@@ -402,8 +546,13 @@ async def list_requests():
                 status=r.status,
                 student_name=a.get("student_name") or "",
                 group=a.get("group") or "",
+                faculty=a.get("faculty") or "",
+                department=a.get("department") or "",
+                created_at=r.created_at,
                 updated_at=r.updated_at,
                 drive_file_url=drive_file_view_url(r.drive_file_id),
+                output_drive_file_id=r.output_drive_file_id or "",
+                error=r.error or "",
             )
         )
     return QueueListResponse(items=items)
@@ -429,6 +578,17 @@ async def get_request(request_id: int):
     }
 
 
+@app.delete("/api/requests/{request_id}")
+async def delete_request(request_id: int):
+    try:
+        STORE.get(int(request_id))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="not found")
+    STORE.delete(int(request_id))
+    log(f"API /requests/{request_id}: удалён")
+    return {"ok": True}
+
+
 @app.post("/api/requests/{request_id}/edit")
 async def save_request_edit(request_id: int, payload: QueueEditState):
     log(f"API /requests/{request_id}/edit: сохранение черновика")
@@ -441,8 +601,7 @@ async def save_request_edit(request_id: int, payload: QueueEditState):
 
 @app.post("/api/requests/{request_id}/reanalyze")
 async def reanalyze_request(request_id: int):
-    """Повторно скачать PDF с Drive и распознать (заявление + сертификаты)."""
-    global _drive
+    """Повторно распознать локальный PDF (заявление + сертификаты)."""
     log(f"API /requests/{request_id}/reanalyze: старт")
     try:
         r = STORE.get(int(request_id))
@@ -454,22 +613,58 @@ async def reanalyze_request(request_id: int):
             detail="Заявление уже отправлено в Drive — повторное распознавание недоступно",
         )
 
-    if _drive is None:
-        _drive = _make_drive_client()
-    if _drive is None:
+    # Получаем PDF: для intake-заявлений берём локальный файл или Drive-ссылку из metadata
+    pdf_bytes: bytes = b""
+    meta = r.analyze_json or {}
+
+    if r.drive_file_id.startswith("intake_"):
+        intake_app_id = meta.get("intake_app_id")
+        # 1) Локальный combined PDF (сохранён при генерации)
+        if intake_app_id:
+            local_pdf = APPLICATIONS_DIR / f"{intake_app_id}_combined.pdf"
+            if local_pdf.is_file():
+                try:
+                    pdf_bytes = local_pdf.read_bytes()
+                    log(f"API /requests/{request_id}/reanalyze: читаем локальный combined PDF")
+                except Exception:
+                    pdf_bytes = b""
+        if not pdf_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail="Файл заявления не найден. Убедитесь, что документ был сформирован через форму /intake.",
+            )
+    elif r.drive_file_id.startswith("upload_"):
+        local_pdf_str = meta.get("local_pdf_path", "")
+        if local_pdf_str and Path(local_pdf_str).is_file():
+            try:
+                pdf_bytes = Path(local_pdf_str).read_bytes()
+                log(f"API /requests/{request_id}/reanalyze: читаем локальный upload PDF")
+            except Exception:
+                pdf_bytes = b""
+        if not pdf_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail="Исходный PDF не найден на сервере.",
+            )
+    else:
         raise HTTPException(
             status_code=400,
-            detail="Drive (service account) не настроен — нельзя скачать PDF",
+            detail="Повторное распознавание недоступно для этого заявления.",
         )
 
+    r = STORE.mark_analyzing(r.id)
+    _broadcast_sse({"type": "updated", **_row_to_sse_dict(r)})
     try:
-        log(f"API /requests/{request_id}/reanalyze: скачивание «{r.filename}»…")
-        pdf_bytes = _drive.download_file_bytes(r.drive_file_id)
         log(f"API /requests/{request_id}/reanalyze: распознавание ({len(pdf_bytes)} байт)…")
-        analyze_json, edit_json = _run_pdf_analysis(pdf_bytes)
+        analyze_json, edit_json = await _run_pdf_analysis_async(pdf_bytes)
+        # Сохраняем специфичные поля если они были в исходном analyze_json
+        for key in ("intake_app_id", "intake_drive_pdf_id", "faculty", "department", "local_pdf_path"):
+            if meta.get(key) is not None and not analyze_json.get(key):
+                analyze_json[key] = meta[key]
         STORE.update_analyze(r.id, analyze_json)
         STORE.save_edit(r.id, edit_json)
         r = STORE.reset_pending(r.id)
+        _broadcast_sse({"type": "updated", **_row_to_sse_dict(r)})
         log(f"API /requests/{request_id}/reanalyze: готово")
         return {
             "ok": True,
@@ -484,46 +679,23 @@ async def reanalyze_request(request_id: int):
     except Exception as e:
         log(f"API /requests/{request_id}/reanalyze: ошибка — {e}")
         log(traceback.format_exc().rstrip())
-        STORE.mark_error(r.id, str(e))
+        r = STORE.mark_error(r.id, str(e))
+        _broadcast_sse({"type": "updated", **_row_to_sse_dict(r)})
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/requests/{request_id}/approve")
 async def approve_request(request_id: int):
-    global _drive
     log(f"API /requests/{request_id}/approve: старт")
     try:
         r = STORE.get(int(request_id))
     except KeyError:
         raise HTTPException(status_code=404, detail="not found")
-    if r.status not in ("pending_approval", "approved", "error"):
+    if r.status not in ("pending_approval", "approved", "error", "sent"):
         raise HTTPException(status_code=400, detail=f"bad status: {r.status}")
-
-    out_folder = (os.environ.get("DRIVE_OUTPUT_FOLDER_ID") or "").strip()
-    if not out_folder:
-        raise HTTPException(status_code=400, detail="DRIVE_OUTPUT_FOLDER_ID is not set")
-    upload_drive = _make_upload_drive_client()
-    if upload_drive is None:
-        mode = _upload_auth_mode()
-        hint = (
-            "Запустите один раз: python drive_oauth_setup.py"
-            if mode == "oauth"
-            else "Проверьте DRIVE_SERVICE_ACCOUNT_JSON"
-        )
-        raise HTTPException(status_code=400, detail=f"Drive upload не настроен. {hint}")
-
-    require_shared = upload_drive.auth_kind == "service_account"
-    out_access = upload_drive.verify_folder_access(
-        out_folder,
-        label="Выходная папка",
-        for_upload=require_shared,
-    )
-    if not out_access["ok"]:
-        raise HTTPException(status_code=400, detail=out_access["message"])
 
     edit = r.edit_json or {}
     plan_data_for_report = (r.analyze_json or {}).get("plan_data") or {}
-    # формируем payload для doc_generator из сохранённого черновика
     student = edit.get("student") or {}
     disciplines = edit.get("disciplines") or []
     certificates = edit.get("certificates") or []
@@ -563,7 +735,8 @@ async def approve_request(request_id: int):
     )
 
     try:
-        STORE.mark_approved(r.id)
+        r = STORE.mark_approved(r.id)
+        _broadcast_sse({"type": "updated", **_row_to_sse_dict(r)})
         log(f"API /requests/{request_id}/approve: генерация DOCX…")
         payload = doc_generator.ReportPayload(
             student_name=gen_req.student_name,
@@ -594,323 +767,26 @@ async def approve_request(request_id: int):
         )
         data = doc_generator.build_report(payload, plan_data=plan_data_for_report or None)
         safe_name = re.sub(r"[^\w\-]+", "_", gen_req.student_name) or f"request_{r.id}"
-        filename = f"ЭЗ_{safe_name}.docx"
-        log(f"API /requests/{request_id}/approve: DOCX {len(data)} байт, загрузка в Drive…")
-        out_id = upload_drive.upload_docx_to_folder(
-            folder_id=out_folder, filename=filename, data=data
-        )
-        STORE.mark_sent(r.id, output_drive_file_id=out_id)
+        filename = f"Заключение_{safe_name}.docx"
+
+        # Сохранить локально всегда
+        local_path = CONCLUSIONS_DIR / filename
+        local_path.write_bytes(data)
+        log(f"API /requests/{request_id}/approve: DOCX сохранён локально → {local_path}")
+
+        r = STORE.mark_sent(r.id, output_drive_file_id=None, local_file_path=str(local_path))
+        _broadcast_sse({"type": "updated", **_row_to_sse_dict(r)})
         log(f"API /requests/{request_id}/approve: успех")
-        return {"ok": True, "output_drive_file_id": out_id}
+        return {"ok": True, "local_file": filename}
     except Exception as e:
         log(f"API /requests/{request_id}/approve: ошибка — {e}")
-        STORE.mark_error(r.id, str(e))
-        detail = str(e)
-        if (
-            "404" in detail
-            or "notFound" in detail
-            or "нет доступа" in detail
-            or "storage quota" in detail.lower()
-            or "квоты" in detail.lower()
-            or "Общем диске" in detail
-        ):
-            raise HTTPException(status_code=400, detail=detail)
-        raise HTTPException(status_code=500, detail=detail)
+        r = STORE.mark_error(r.id, str(e))
+        _broadcast_sse({"type": "updated", **_row_to_sse_dict(r)})
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# ---------------------------------------------------------------------------
-# Drive polling worker
-# ---------------------------------------------------------------------------
-def _drive_env_summary() -> dict[str, str]:
-    return {
-        "enabled": (os.environ.get("DRIVE_ENABLED") or "").strip(),
-        "sa_json": (os.environ.get("DRIVE_SERVICE_ACCOUNT_JSON") or "").strip(),
-        "input_folder": (os.environ.get("DRIVE_INPUT_FOLDER_ID") or "").strip(),
-        "output_folder": (os.environ.get("DRIVE_OUTPUT_FOLDER_ID") or "").strip(),
-        "poll_interval": (os.environ.get("DRIVE_POLL_INTERVAL") or "60").strip(),
-    }
 
 
-def _make_drive_client() -> DriveClient | None:
-    global _drive_status
-    sa = (os.environ.get("DRIVE_SERVICE_ACCOUNT_JSON") or "").strip()
-    _drive_status["input_folder_id"] = (os.environ.get("DRIVE_INPUT_FOLDER_ID") or "").strip()
-    _drive_status["output_folder_id"] = (os.environ.get("DRIVE_OUTPUT_FOLDER_ID") or "").strip()
-
-    if not sa:
-        _drive_status["configured"] = False
-        _drive_status["connected"] = False
-        _drive_status["last_check_message"] = "DRIVE_SERVICE_ACCOUNT_JSON не задан"
-        log("Drive: ✗ не настроен — нет пути к JSON ключу")
-        return None
-
-    sa_path = Path(sa)
-    if not sa_path.is_file():
-        _drive_status["configured"] = False
-        _drive_status["connected"] = False
-        _drive_status["last_check_message"] = f"Файл ключа не найден: {sa}"
-        log(f"Drive: ✗ файл ключа не найден: {sa}")
-        return None
-
-    _drive_status["configured"] = True
-    log(f"Drive: проверка ключа… ({sa})")
-    try:
-        client = DriveClient.from_service_account(service_account_json_path=str(sa_path))
-        _drive_status["service_account_email"] = client.service_account_email
-        return client
-    except Exception as e:
-        _drive_status["connected"] = False
-        _drive_status["last_error"] = str(e)
-        _drive_status["last_check_message"] = str(e)
-        log(f"Drive: ✗ не удалось создать клиент — {e}")
-        log(traceback.format_exc().rstrip())
-        return None
-
-
-def _upload_auth_mode() -> str:
-    return (os.environ.get("DRIVE_UPLOAD_AUTH") or "service_account").strip().lower()
-
-
-def _make_upload_drive_client() -> DriveClient | None:
-    """Клиент для загрузки DOCX: oauth (Мой диск) или service account (общий диск)."""
-    global _drive_status
-    mode = _upload_auth_mode()
-    _drive_status["upload_auth"] = mode
-
-    if mode == "oauth":
-        from drive_oauth import load_credentials, resolve_client_secrets_path
-
-        base = Path(__file__).parent
-        try:
-            client_json = str(resolve_client_secrets_path())
-        except FileNotFoundError as e:
-            log(f"Drive OAuth: ✗ {e}")
-            return None
-        token_json = (
-            (os.environ.get("DRIVE_OAUTH_TOKEN_JSON") or "").strip()
-            or str(base / "secrets" / "drive-oauth-token.json")
-        )
-        _drive_status["oauth_token_ready"] = Path(token_json).is_file()
-        if not Path(client_json).is_file():
-            log(f"Drive OAuth: ✗ нет client JSON: {client_json}")
-            return None
-        if not Path(token_json).is_file():
-            log(
-                "Drive OAuth: ✗ нет токена. Запустите: python drive_oauth_setup.py"
-            )
-            return None
-        try:
-            creds = load_credentials(
-                client_secrets_path=client_json,
-                token_path=token_json,
-            )
-            return DriveClient(creds, auth_kind="oauth", label="OAuth upload")
-        except Exception as e:
-            log(f"Drive OAuth: ✗ {e}")
-            log(traceback.format_exc().rstrip())
-            return None
-
-    return _make_drive_client()
-
-
-def _drive_startup_check(client: DriveClient) -> bool:
-    """Пробное подключение к входной и выходной папкам при старте."""
-    global _drive_status
-    email = _drive_status.get("service_account_email") or "(client_email в JSON)"
-    log(f"Drive: сервисный аккаунт для шаринга папок: {email}")
-
-    in_folder = _drive_status["input_folder_id"]
-    out_folder = _drive_status["output_folder_id"]
-    _drive_status["last_check_at"] = int(time.time())
-
-    if not in_folder:
-        _drive_status["connected"] = False
-        _drive_status["last_check_message"] = "DRIVE_INPUT_FOLDER_ID не задан"
-        log("Drive: ✗ входная папка не задана (DRIVE_INPUT_FOLDER_ID)")
-        return False
-
-    log(f"Drive: проверка ВХОДНОЙ папки {in_folder}…")
-    probe = client.probe_folder(in_folder)
-    _drive_status["connected"] = bool(probe["ok"])
-    _drive_status["last_check_message"] = probe["message"]
-
-    if probe["ok"]:
-        log(f"Drive: ✓ вход — {probe['message']}")
-        if probe["pdf_count"] == 0:
-            log("Drive: во входной папке пока нет PDF")
-    else:
-        _drive_status["last_error"] = probe["message"]
-        log(f"Drive: ✗ вход — {probe['message']}")
-        return False
-
-    if not out_folder:
-        _drive_status["output_connected"] = False
-        _drive_status["output_check_message"] = "DRIVE_OUTPUT_FOLDER_ID не задан"
-        log("Drive: ⚠ выходная папка не задана — апрув с загрузкой DOCX не сработает")
-        return True
-
-    upload_mode = _upload_auth_mode()
-    _drive_status["upload_auth"] = upload_mode
-    log(f"Drive: загрузка DOCX — режим «{upload_mode}»")
-
-    upload_client = _make_upload_drive_client()
-    if upload_client is None:
-        _drive_status["output_connected"] = False
-        _drive_status["output_check_message"] = (
-            "OAuth: запустите python drive_oauth_setup.py"
-            if upload_mode == "oauth"
-            else "Service account не настроен"
-        )
-        log(f"Drive: ✗ выход — {_drive_status['output_check_message']}")
-        return _drive_status["connected"]
-
-    log(f"Drive: проверка ВЫХОДНОЙ папки {out_folder}…")
-    require_shared = upload_client.auth_kind == "service_account"
-    out_access = upload_client.verify_folder_access(
-        out_folder,
-        label="Выходная папка",
-        for_upload=require_shared,
-    )
-    _drive_status["output_connected"] = bool(out_access["ok"])
-    _drive_status["output_shared_drive"] = bool(out_access.get("shared_drive"))
-    _drive_status["output_check_message"] = out_access["message"]
-    if out_access["ok"]:
-        log(f"Drive: ✓ выход — {out_access['message']}")
-    else:
-        _drive_status["last_error"] = out_access["message"]
-        log(f"Drive: ✗ выход — {out_access['message']}")
-        if upload_mode == "service_account":
-            log(
-                "Drive: исправление — общий диск (Shared Drive) или OAuth: "
-                "DRIVE_UPLOAD_AUTH=oauth и python drive_oauth_setup.py"
-            )
-        else:
-            log(
-                "Drive: папка должна быть в вашем Google Drive (тот же аккаунт, "
-                "что при OAuth). ID — из URL папки."
-            )
-    return _drive_status["connected"]
-
-
-async def _drive_poll_loop() -> None:
-    global _drive, _drive_status
-    interval_s = int((os.environ.get("DRIVE_POLL_INTERVAL") or "60").strip() or "60")
-    in_folder = _drive_status["input_folder_id"] or (os.environ.get("DRIVE_INPUT_FOLDER_ID") or "").strip()
-    if not in_folder:
-        log("Воркер: ✗ DRIVE_INPUT_FOLDER_ID не задан — воркер остановлен")
-        return
-
-    if _drive is None:
-        _drive = _make_drive_client()
-    if _drive is None:
-        log("Воркер: ✗ нет Drive-клиента — воркер остановлен")
-        return
-
-    if not _drive_status.get("connected"):
-        _drive_startup_check(_drive)
-
-    log(
-        f"Воркер: ✓ запущен | интервал {interval_s} с | "
-        f"вход: {in_folder} | выход: {_drive_status.get('output_folder_id') or '—'}"
-    )
-    cycle_num = 0
-    while True:
-        cycle_num += 1
-        try:
-            log(f"——— Воркер: цикл #{cycle_num} ———")
-            if not _drive_status.get("connected"):
-                log("Воркер: повторная проверка подключения…")
-                if not _drive_startup_check(_drive):
-                    _drive_status["last_poll_at"] = int(time.time())
-                    _drive_status["last_poll_ok"] = False
-                    _drive_status["last_poll_message"] = _drive_status.get("last_check_message") or "нет подключения"
-                    log(f"Воркер: цикл #{cycle_num} пропущен — Drive недоступен")
-                    await asyncio.sleep(max(10, interval_s))
-                    continue
-
-            pdfs = _drive.list_pdfs_in_folder(in_folder)
-            total = len(pdfs)
-            skipped = 0
-            new_count = 0
-            processed_ok = 0
-            processed_err = 0
-
-            for f in pdfs:
-                # если уже обработано/в очереди — пропускаем без скачивания
-                existing = STORE.get_by_drive_file_id(f.id)
-                if existing is not None:
-                    skipped += 1
-                    log(
-                        f"Воркер: пропуск «{f.name}» — уже в очереди "
-                        f"(#{existing.id}, статус={existing.status})"
-                    )
-                    continue
-
-                new_count += 1
-                log(f"Воркер: ▶ НОВЫЙ файл с Drive «{f.name}» (drive_id={f.id})")
-                # создаём запись (pending) сразу, чтобы дублей не было
-                row = STORE.upsert_pending(
-                    drive_file_id=f.id,
-                    filename=f.name,
-                    analyze_json={
-                        "student_name": "",
-                        "group": "",
-                        "program_code": "",
-                        "course_year": "",
-                        "phone": "",
-                        "application_date": "",
-                        "disciplines": [],
-                        "certificates": [],
-                        "mapping": {},
-                        "errors": [],
-                    },
-                )
-
-                try:
-                    pdf_bytes = _drive.download_file_bytes(f.id)
-                    log(f"Воркер: #{row.id} — распознавание PDF ({len(pdf_bytes)} байт)…")
-                    analyze_json, edit_json = _run_pdf_analysis(pdf_bytes)
-                    STORE.update_analyze(row.id, analyze_json)
-                    STORE.save_edit(row.id, edit_json)
-                    processed_ok += 1
-                    log(f"Воркер: ✓ #{row.id} «{f.name}» — распознано, ждёт апрува на /approve")
-                except Exception as e:
-                    processed_err += 1
-                    log(f"Воркер: ✗ #{row.id} «{f.name}» — ошибка: {e}")
-                    log(traceback.format_exc().rstrip())
-                    STORE.mark_error(row.id, str(e))
-
-            summary = (
-                f"цикл #{cycle_num}: в папке PDF={total}, "
-                f"новых={new_count}, уже в очереди={skipped}, "
-                f"успешно обработано={processed_ok}, ошибок={processed_err}"
-            )
-            _drive_status["last_poll_at"] = int(time.time())
-            _drive_status["last_poll_ok"] = True
-            _drive_status["last_poll_message"] = summary
-            _drive_status["last_error"] = None if processed_err == 0 else f"ошибок в цикле: {processed_err}"
-
-            if total == 0:
-                log("Воркер: итог — папка пустая (0 PDF на Drive)")
-            elif new_count == 0:
-                log(f"Воркер: итог — {summary} (с Drive ничего нового не взято)")
-            else:
-                log(f"Воркер: итог — {summary}")
-        except asyncio.CancelledError:
-            log("Воркер: остановка")
-            raise
-        except Exception as ex:
-            _drive_status["last_poll_at"] = int(time.time())
-            _drive_status["last_poll_ok"] = False
-            _drive_status["last_poll_message"] = str(ex)
-            _drive_status["last_error"] = str(ex)
-            _drive_status["connected"] = False
-            log(f"Воркер: ✗ ошибка цикла #{cycle_num} — {ex}")
-            log(traceback.format_exc().rstrip())
-            log("Воркер: на следующем цикле попробуем подключиться снова")
-
-        log(f"Воркер: пауза {interval_s} с…")
-        await asyncio.sleep(max(10, interval_s))
 
 
 # ---------------------------------------------------------------------------
@@ -919,6 +795,225 @@ async def _drive_poll_loop() -> None:
 @app.get("/intake")
 async def intake_page():
     return FileResponse(str(STATIC_DIR / "intake.html"))
+
+
+@app.get("/applications")
+async def applications_page():
+    return FileResponse(str(STATIC_DIR / "applications.html"))
+
+
+@app.get("/api/intake/applications")
+async def list_intake_applications():
+    INTAKE_STORE.sync_from_queue(STORE)
+    apps = INTAKE_STORE.list(limit=300)
+    return {
+        "items": [
+            {
+                "id": a.id,
+                "student_name": a.student_name,
+                "faculty": a.faculty,
+                "department": a.department,
+                "group_name": a.group_name,
+                "course_year": a.course_year,
+                "phone": a.phone,
+                "subjects": a.subjects,
+                "status": a.status,
+                "drive_pdf_id": a.drive_pdf_id or "",
+                "queue_request_id": a.queue_request_id,
+                "output_drive_file_id": a.output_drive_file_id or "",
+                "created_at": a.created_at,
+                "updated_at": a.updated_at,
+            }
+            for a in apps
+        ]
+    }
+
+
+@app.get("/api/intake/applications/{app_id}")
+async def get_intake_application(app_id: int):
+    try:
+        a = INTAKE_STORE.get(int(app_id))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="not found")
+    INTAKE_STORE.sync_from_queue(STORE)
+    a = INTAKE_STORE.get(int(app_id))
+    return {
+        "id": a.id,
+        "student_name": a.student_name,
+        "faculty": a.faculty,
+        "department": a.department,
+        "group_name": a.group_name,
+        "course_year": a.course_year,
+        "phone": a.phone,
+        "subjects": a.subjects,
+        "status": a.status,
+        "drive_pdf_id": a.drive_pdf_id or "",
+        "queue_request_id": a.queue_request_id,
+        "output_drive_file_id": a.output_drive_file_id or "",
+        "created_at": a.created_at,
+        "updated_at": a.updated_at,
+    }
+
+
+@app.get("/api/intake/applications/{app_id}/pdf")
+async def serve_intake_pdf(app_id: int):
+    path = APPLICATIONS_DIR / f"{app_id}_combined.pdf"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="PDF не найден")
+    encoded = urllib.parse.quote(f"application_{app_id}.pdf")
+    return FileResponse(
+        str(path),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"inline; filename*=UTF-8''{encoded}"},
+    )
+
+
+async def _analyze_intake_pdf_bg(
+    queue_row_id: int,
+    drive_pdf_id: str,
+    intake_app_id: int,
+    faculty: str,
+    department: str,
+) -> None:
+    """Фоновой LLM-анализ PDF сертификатов для обогащения данных у эксперта."""
+    pdf_bytes: bytes = b""
+
+    # Пробуем взять локальный combined PDF (сохранён при генерации)
+    local_pdf = APPLICATIONS_DIR / f"{intake_app_id}_combined.pdf"
+    if local_pdf.is_file():
+        try:
+            pdf_bytes = local_pdf.read_bytes()
+            log(f"Фоновой анализ intake PDF queue#{queue_row_id}: читаем локальный файл")
+        except Exception:
+            pdf_bytes = b""
+
+    if not pdf_bytes:
+        log(f"Фоновой анализ intake PDF queue#{queue_row_id}: нет PDF — пропускаем")
+        return
+
+    try:
+        llm_analyze, llm_edit = await _run_pdf_analysis_async(pdf_bytes)
+        llm_analyze["intake_app_id"] = intake_app_id
+        llm_analyze["faculty"] = faculty
+        llm_analyze["department"] = department
+        if llm_analyze.get("certificates"):
+            STORE.update_analyze(queue_row_id, llm_analyze)
+            STORE.save_edit(queue_row_id, llm_edit)
+            log(f"Фоновой анализ intake PDF queue#{queue_row_id}: OK, сертификатов={len(llm_analyze['certificates'])}")
+        else:
+            log(f"Фоновой анализ intake PDF queue#{queue_row_id}: LLM не нашёл сертификатов — оставляем базовые данные")
+        row = STORE.reset_pending(queue_row_id)
+        _broadcast_sse({"type": "updated", **_row_to_sse_dict(row)})
+    except Exception as e:
+        log(f"Фоновой анализ intake PDF queue#{queue_row_id}: ошибка LLM — {e}")
+        try:
+            row = STORE.mark_error(queue_row_id, str(e))
+            _broadcast_sse({"type": "updated", **_row_to_sse_dict(row)})
+        except Exception:
+            pass
+
+
+@app.post("/api/intake/applications/{app_id}/send-to-review")
+async def send_intake_to_review(app_id: int):
+    try:
+        a = INTAKE_STORE.get(int(app_id))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="not found")
+    if a.status != "created":
+        raise HTTPException(status_code=400, detail=f"Нельзя отправить: статус '{a.status}'")
+
+    disciplines = [s.get("name", "") for s in (a.subjects or []) if s.get("name")]
+    program_code = doc_generator.derive_program(a.group_name)
+
+    # Собираем сертификаты из источников, указанных студентом
+    certs_analyze: list[dict[str, Any]] = []
+    certs_edit: list[dict[str, Any]] = []
+    for disc_idx, subj in enumerate(a.subjects or []):
+        for cert in (subj.get("certs") or []):
+            source = str(cert.get("source") or "").strip()
+            if source:
+                certs_analyze.append({
+                    "page": 0,
+                    "course_title": source,
+                    "provider": "",
+                    "hours": "",
+                    "grade": "",
+                    "date": "",
+                    "student_name": a.student_name,
+                    "certificate_id": "",
+                    "verify_url": source if source.startswith("http") else "",
+                })
+                certs_edit.append({
+                    "course_title": source,
+                    "provider": "",
+                    "hours": "",
+                    "grade": "",
+                    "date": "",
+                    "_bound": disc_idx,
+                })
+
+    analyze_json: dict[str, Any] = {
+        "student_name": a.student_name,
+        "group": a.group_name,
+        "program_code": program_code,
+        "course_year": a.course_year,
+        "phone": a.phone,
+        "application_date": "",
+        "disciplines": disciplines,
+        "certificates": certs_analyze,
+        "mapping": {str(i): certs_edit[i]["_bound"] for i in range(len(certs_edit))},
+        "errors": [],
+        "plan_data": {},
+        "intake_app_id": a.id,
+        "faculty": a.faculty,
+        "department": a.department,
+        "intake_drive_pdf_id": a.drive_pdf_id or "",
+    }
+    edit_json: dict[str, Any] = {
+        "student": {
+            "name": a.student_name,
+            "group": a.group_name,
+            "program_code": program_code,
+            "course_year": a.course_year,
+        },
+        "disciplines": [
+            {
+                "name": d,
+                "plan_credits": "5",
+                "total_hours": "",
+                "grade_points": "",
+                "compliance": "полное",
+                "note": "",
+                "final_grade": "",
+            }
+            for d in disciplines
+        ],
+        "certificates": certs_edit,
+    }
+
+    synthetic_drive_id = f"intake_{a.id}"
+    safe_name = re.sub(r"[^\w\-]+", "_", a.student_name) or f"intake_{a.id}"
+    filename = f"Заявление_{safe_name}.pdf"
+
+    row = STORE.upsert_pending(
+        drive_file_id=synthetic_drive_id,
+        filename=filename,
+        analyze_json=analyze_json,
+        status="analyzing",
+    )
+    STORE.save_edit(row.id, edit_json)
+    INTAKE_STORE.send_to_review(a.id, row.id)
+    log(f"API /intake/applications/{app_id}/send-to-review: queue #{row.id}, сертификатов={len(certs_edit)}")
+    _broadcast_sse({"type": "added", **_row_to_sse_dict(row)})
+
+    # Фоновой LLM-анализ PDF сертификатов для обогащения данных у эксперта
+    _local_pdf_check = APPLICATIONS_DIR / f"{a.id}_combined.pdf"
+    if _local_pdf_check.is_file():
+        asyncio.create_task(
+            _analyze_intake_pdf_bg(row.id, "", a.id, a.faculty, a.department)
+        )
+
+    return {"ok": True, "queue_request_id": row.id}
 
 
 @app.post("/api/intake/generate")
@@ -956,6 +1051,17 @@ async def intake_generate(request: Request):
 
     log(f"API /intake/generate: «{p.student_name}», предметов={len(p.subjects)}")
 
+    subjects_for_store = []
+    for i, s in enumerate(subjects_list):
+        raw = raw_subjects[i] if i < len(raw_subjects) else {}
+        raw_dict = raw if isinstance(raw, dict) else {"name": raw}
+        subjects_for_store.append({
+            "name": s.name,
+            "certs": [{"source": src} for src in s.cert_sources],
+            "faculty": str(raw_dict.get("faculty") or ""),
+            "department": str(raw_dict.get("department") or ""),
+        })
+
     docx_bytes = application_generator.build_application_docx(p)
 
     # Collect certificate files: keys are cert_{subj_idx}_{cert_idx}
@@ -973,93 +1079,308 @@ async def intake_generate(request: Request):
             except Exception:
                 pass
 
-    # Flatten certs in subject/cert order for combined PDF
+    # Flatten certs in subject/cert order; also build per-subject groups
     cert_list: list[bytes] = []
     cert_fnames: list[str] = []
+    cert_groups: list[list[bytes]] = []
     for si, subj in enumerate(p.subjects):
+        group: list[bytes] = []
         n_certs = len((raw_subjects[si].get("certs") or [])) if si < len(raw_subjects) and isinstance(raw_subjects[si], dict) else 1
-        for ci in range(max(n_certs, 1)):
+        for ci in range(n_certs):
             b = cert_bytes_map.get((si, ci), b"")
             if b:
                 cert_list.append(b)
                 cert_fnames.append(cert_names_map.get((si, ci), ""))
+                group.append(b)
+        cert_groups.append(group)
 
-    drive_url = ""
-    drive_error = ""
+    # Save intake application to local store
+    intake_app = INTAKE_STORE.create(
+        student_name=p.student_name,
+        faculty=p.faculty,
+        department=p.department,
+        group_name=p.group,
+        course_year=p.course_year,
+        phone=p.phone,
+        subjects=subjects_for_store,
+    )
+
+    # Save DOCX locally
+    _app_safe = re.sub(r"[^\w\-]+", "_", p.student_name) or f"app_{intake_app.id}"
+    _local_docx = APPLICATIONS_DIR / f"Заявление_{intake_app.id}_{_app_safe}.docx"
+    try:
+        _local_docx.write_bytes(docx_bytes)
+        INTAKE_STORE.set_local_docx(intake_app.id, str(_local_docx))
+        log(f"API /intake/generate: DOCX сохранён локально → {_local_docx}")
+    except Exception as _ex:
+        log(f"API /intake/generate: не удалось сохранить DOCX — {_ex}")
+
+    # Строим combined PDF (заявление + сертификаты)
+    combined_pdf: bytes = b""
     try:
         app_pdf = application_generator.build_application_pdf_page(p)
         combined_pdf = application_generator.build_combined_pdf(
-            app_pdf, cert_list, payload=p, cert_groups=None, cert_filenames=cert_fnames
+            app_pdf, cert_list, payload=p, cert_groups=cert_groups, cert_filenames=cert_fnames
         )
+        log(f"API /intake/generate: combined PDF {len(combined_pdf)} байт, страниц сертификатов={len(cert_list)}")
+    except Exception as _pdf_ex:
+        log(f"API /intake/generate: ошибка сборки PDF — {_pdf_ex}")
 
-        upload_client = _make_upload_drive_client()
-        if upload_client is None:
-            drive_error = "Drive не настроен (нет учётных данных)"
-        elif not INTAKE_FOLDER_ID:
-            drive_error = "DRIVE_INTAKE_FOLDER_ID не задан"
-        else:
-            safe = re.sub(r"[^\w\-]+", "_", p.student_name) or "Заявление"
-            pdf_name = f"Заявление_{safe}.pdf"
-            fid = upload_client.upload_pdf_to_folder(
-                folder_id=INTAKE_FOLDER_ID, filename=pdf_name, data=combined_pdf
-            )
-            drive_url = f"https://drive.google.com/file/d/{fid}/view"
-            log(f"API /intake/generate: PDF загружен → {drive_url}")
-    except Exception as ex:
-        drive_error = str(ex)
-        log(f"API /intake/generate: ошибка Drive — {ex}")
+    # Сохраняем combined PDF локально
+    if combined_pdf:
+        _local_pdf = APPLICATIONS_DIR / f"{intake_app.id}_combined.pdf"
+        try:
+            _local_pdf.write_bytes(combined_pdf)
+            log(f"API /intake/generate: combined PDF сохранён → {_local_pdf}")
+        except Exception as _ex:
+            log(f"API /intake/generate: не удалось сохранить combined PDF — {_ex}")
 
     safe_name = re.sub(r"[^\w\-]+", "_", p.student_name) or "Заявление"
     docx_filename = f"Заявление_{safe_name}.docx"
     encoded = urllib.parse.quote(docx_filename)
-    headers: dict[str, str] = {
-        "Content-Disposition": (
-            f'attachment; filename="application.docx"; filename*=utf-8\'\'{encoded}'
-        ),
-    }
-    if drive_url:
-        headers["X-Drive-Url"] = drive_url
-    if drive_error:
-        headers["X-Drive-Error"] = urllib.parse.quote(drive_error[:500])
-
     return Response(
         content=docx_bytes,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers=headers,
+        headers={"Content-Disposition": f'attachment; filename="application.docx"; filename*=utf-8\'\'{encoded}'},
     )
+
+
+@app.get("/conclusions")
+async def conclusions_page():
+    return FileResponse(str(STATIC_DIR / "conclusions.html"))
+
+
+@app.get("/api/conclusions")
+async def list_conclusions():
+    rows = STORE.list(status="sent", limit=300)
+    return {
+        "items": [
+            {
+                "id": r.id,
+                "filename": r.filename,
+                "student_name": (r.analyze_json or {}).get("student_name") or "",
+                "group": (r.analyze_json or {}).get("group") or "",
+                "faculty": (r.analyze_json or {}).get("faculty") or "",
+                "department": (r.analyze_json or {}).get("department") or "",
+                "output_drive_file_id": r.output_drive_file_id or "",
+                "local_file_path": r.local_file_path or "",
+                "has_local_file": bool(r.local_file_path and Path(r.local_file_path).is_file()),
+                "created_at": r.created_at,
+                "updated_at": r.updated_at,
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.get("/api/conclusions/{request_id}/download")
+async def download_conclusion(request_id: int):
+    try:
+        r = STORE.get(int(request_id))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="not found")
+    if not r.local_file_path:
+        raise HTTPException(status_code=404, detail="Файл не сохранён локально")
+    local_path = Path(r.local_file_path)
+    if not local_path.is_file():
+        raise HTTPException(status_code=404, detail="Файл не найден на диске")
+    encoded = urllib.parse.quote(local_path.name)
+    return FileResponse(
+        str(local_path),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="conclusion.docx"; filename*=utf-8\'\'{encoded}'},
+    )
+
+
+@app.get("/api/requests/{request_id}/pdf")
+async def serve_request_pdf(request_id: int):
+    try:
+        r = STORE.get(int(request_id))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="not found")
+    local_path_str = (r.analyze_json or {}).get("local_pdf_path", "")
+    if not local_path_str:
+        raise HTTPException(status_code=404, detail="PDF не найден")
+    local_path = Path(local_path_str)
+    if not local_path.is_file():
+        raise HTTPException(status_code=404, detail="Файл не найден на диске")
+    encoded = urllib.parse.quote(local_path.name)
+    return FileResponse(
+        str(local_path),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"inline; filename*=UTF-8''{encoded}"},
+    )
+
+
+@app.get("/api/applications/{app_id}/download")
+async def download_application_docx(app_id: int):
+    try:
+        a = INTAKE_STORE.get(int(app_id))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="not found")
+    if not a.local_docx_path:
+        raise HTTPException(status_code=404, detail="Файл не сохранён локально")
+    local_path = Path(a.local_docx_path)
+    if not local_path.is_file():
+        raise HTTPException(status_code=404, detail="Файл не найден на диске")
+    encoded = urllib.parse.quote(local_path.name)
+    return FileResponse(
+        str(local_path),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="application.docx"; filename*=utf-8\'\'{encoded}'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Admin panel
+# ---------------------------------------------------------------------------
+_ADMIN_USER = "admin"
+_ADMIN_PASS_HASH = "04501b8754661491e7a537b1d724e664c9a8b25605dc8e6d31b0472dc7079290"
+_admin_sessions: dict[str, int] = {}
+_ADMIN_TTL = 8 * 3600
+
+
+def _admin_ok(token: str | None) -> bool:
+    if not token:
+        return False
+    exp = _admin_sessions.get(token)
+    if exp is None or int(time.time()) > exp:
+        _admin_sessions.pop(token, None)
+        return False
+    return True
+
+
+def _require_admin(admin_token: str | None = Cookie(None)) -> str:
+    if not _admin_ok(admin_token):
+        raise HTTPException(status_code=401, detail="Не авторизован")
+    return admin_token  # type: ignore[return-value]
+
+
+class AdminStatusBody(BaseModel):
+    status: str
+    delete_queue: bool = False
+
+
+@app.get("/admin")
+async def admin_page():
+    return FileResponse(str(STATIC_DIR / "admin.html"))
+
+
+@app.post("/admin/login")
+async def admin_login(
+    response: Response,
+    username: str = Form(...),
+    password: str = Form(...),
+):
+    pw_hash = hashlib.sha256(password.encode()).hexdigest()
+    if username != _ADMIN_USER or pw_hash != _ADMIN_PASS_HASH:
+        raise HTTPException(status_code=401, detail="Неверный логин или пароль")
+    token = secrets.token_hex(32)
+    _admin_sessions[token] = int(time.time()) + _ADMIN_TTL
+    response.set_cookie("admin_token", token, httponly=True, max_age=_ADMIN_TTL, samesite="strict")
+    return {"ok": True}
+
+
+@app.post("/admin/logout")
+async def admin_logout(response: Response, _: str = Depends(_require_admin)):
+    response.delete_cookie("admin_token")
+    return {"ok": True}
+
+
+@app.get("/admin/api/me")
+async def admin_me(admin_token: str | None = Cookie(None)):
+    return {"logged_in": _admin_ok(admin_token)}
+
+
+@app.get("/admin/api/apps")
+async def admin_list_apps(_: str = Depends(_require_admin)):
+    INTAKE_STORE.sync_from_queue(STORE)
+    apps = INTAKE_STORE.list(limit=500)
+    return {
+        "items": [
+            {
+                "id": a.id,
+                "student_name": a.student_name,
+                "faculty": a.faculty,
+                "department": a.department,
+                "group_name": a.group_name,
+                "course_year": a.course_year,
+                "status": a.status,
+                "drive_pdf_id": a.drive_pdf_id or "",
+                "queue_request_id": a.queue_request_id,
+                "output_drive_file_id": a.output_drive_file_id or "",
+                "created_at": a.created_at,
+                "updated_at": a.updated_at,
+            }
+            for a in apps
+        ]
+    }
+
+
+@app.post("/admin/api/apps/{app_id}/status")
+async def admin_set_status(
+    app_id: int,
+    body: AdminStatusBody,
+    _: str = Depends(_require_admin),
+):
+    allowed = ("created", "in_review", "done")
+    if body.status not in allowed:
+        raise HTTPException(status_code=400, detail=f"Статус должен быть одним из: {allowed}")
+    try:
+        a = INTAKE_STORE.get(int(app_id))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="not found")
+
+    old_queue_id = a.queue_request_id
+    INTAKE_STORE.reset_status(int(app_id), body.status)
+
+    if body.delete_queue and old_queue_id:
+        try:
+            STORE.delete(int(old_queue_id))
+            log(f"Admin: удалена запись очереди #{old_queue_id} при сбросе заявления #{app_id}")
+        except Exception:
+            pass
+
+    log(f"Admin: заявление #{app_id} → {body.status}")
+    return {"ok": True}
+
+
+@app.get("/admin/api/queue")
+async def admin_list_queue(_: str = Depends(_require_admin)):
+    rows = STORE.list(limit=500)
+    return {
+        "items": [
+            {
+                "id": r.id,
+                "filename": r.filename,
+                "drive_file_id": r.drive_file_id,
+                "status": r.status,
+                "student_name": (r.analyze_json or {}).get("student_name") or "",
+                "intake_app_id": (r.analyze_json or {}).get("intake_app_id"),
+                "error": r.error or "",
+                "created_at": r.created_at,
+                "updated_at": r.updated_at,
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.delete("/admin/api/queue/{request_id}")
+async def admin_delete_queue(request_id: int, _: str = Depends(_require_admin)):
+    try:
+        STORE.get(int(request_id))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="not found")
+    STORE.delete(int(request_id))
+    log(f"Admin: удалена запись очереди #{request_id}")
+    return {"ok": True}
 
 
 @app.on_event("startup")
 async def _startup() -> None:
-    global _poll_task, _drive, _drive_status
     log("========== Старт приложения ==========")
-    env = _drive_env_summary()
     log(
-        f"Конфиг: DRIVE_ENABLED={env['enabled'] or '—'}, "
-        f"poll={env['poll_interval']}с, "
-        f"вход={env['input_folder'][:16] + '…' if env['input_folder'] else '—'}, "
-        f"выход={env['output_folder'][:16] + '…' if env['output_folder'] else '—'}"
+        f"Конфиг: GEMINI_KEY={'✓' if os.environ.get('GEMINI_API_KEY') else '—'}, "
+        f"OPENROUTER_KEY={'✓' if os.environ.get('OPENROUTER_API_KEY') else '—'}"
     )
-
-    enabled = env["enabled"].lower() in ("1", "true", "yes", "on")
-    _drive_status["enabled"] = enabled
-    if not enabled:
-        log("Drive: воркер выключен (DRIVE_ENABLED не 1/true)")
-        return
-
-    _drive = _make_drive_client()
-    if _drive is not None:
-        _drive_startup_check(_drive)
-
-    if _poll_task is None:
-        log("Drive-воркер: фоновая задача опроса запущена")
-        _poll_task = asyncio.create_task(_drive_poll_loop())
-
-
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    global _poll_task
-    log("Остановка приложения")
-    if _poll_task:
-        _poll_task.cancel()
-        _poll_task = None
