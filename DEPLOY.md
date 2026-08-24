@@ -17,11 +17,13 @@ docker-compose.yml            — запуск app + ngrok контейнеро�
 
 `github.com → репозиторий → Settings → Secrets and variables → Actions → New repository secret`
 
-| Name | Значение |
-|------|----------|
-| `GEMINI_API_KEY` | ключ Gemini API |
-| `NGROK_AUTHTOKEN` | токен ngrok |
-| `NGROK_DOMAIN` | домен ngrok (например `one-mutual-vulture.ngrok-free.app`) |
+
+| Name              | Значение                                                   |
+| ----------------- | ---------------------------------------------------------- |
+| `GEMINI_API_KEY`  | ключ Gemini API                                            |
+| `NGROK_AUTHTOKEN` | токен ngrok                                                |
+| `NGROK_DOMAIN`    | домен ngrok (например `one-mutual-vulture.ngrok-free.app`) |
+
 
 ---
 
@@ -32,9 +34,9 @@ docker-compose.yml            — запуск app + ngrok контейнеро�
 3. Перезагрузить ПК
 4. Запустить Docker Desktop (иконка в трее не должна показывать ошибку)
 5. Проверить в PowerShell:
-   ```powershell
+  ```powershell
    docker --version
-   ```
+  ```
 
 ---
 
@@ -72,6 +74,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 ```
 
 Проверить:
+
 ```powershell
 .\svc.cmd status   # должно быть "Running"
 ```
@@ -87,6 +90,7 @@ Add-LocalGroupMember -Group "docker-users" -Member "NT AUTHORITY\SYSTEM"
 ```
 
 Перезапустить сервис:
+
 ```powershell
 .\svc.cmd stop
 .\svc.cmd start
@@ -105,6 +109,7 @@ git push origin main
 ```
 
 После push GitHub автоматически:
+
 1. Запустит workflow на постоянном ПК
 2. Создаст `.env` из секретов
 3. Выполнит `docker compose up -d --build`
@@ -156,3 +161,4 @@ docker compose down
 # Принудительный деплой без push (запустить вручную)
 # GitHub → Actions → Deploy → Run workflow
 ```
+
