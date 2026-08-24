@@ -13,8 +13,10 @@ import base64
 import json
 import logging
 import os
+import random
 import re
 import sys
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -57,6 +59,27 @@ OPENROUTER_MODELS = [
 RENDER_DPI = int(os.environ.get("RENDER_DPI", "150"))
 MAX_WORKERS = int(os.environ.get("ANALYZER_WORKERS", "6"))
 MAX_RETRIES = int(os.environ.get("ANALYZER_RETRIES", "3"))
+
+# --- Ожидание ответа модели на временных сбоях (503/429/сеть) ---
+# Если включено — на ВРЕМЕННЫХ ошибках (перегрузка Gemini 503, rate limit 429, сетевые)
+# повторяем попытки «до победного», не ограничиваясь MAX_RETRIES, пока не получим ответ
+# или не упрёмся в общий таймаут на страницу (ANALYZER_MAX_WAIT секунд).
+# Постоянные ошибки (дневной лимит, неверный ключ) сюда НЕ попадают — они сразу уводят
+# на следующего провайдера, чтобы не висеть бесконечно.
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on", "да")
+
+WAIT_FOR_TRANSIENT = _env_bool("ANALYZER_WAIT_TRANSIENT", True)
+# Максимальное суммарное время ожидания транзиентных ретраев на ОДНУ страницу, сек.
+MAX_WAIT_SECONDS = float(os.environ.get("ANALYZER_MAX_WAIT", "900"))
+# Потолок паузы между попытками, сек.
+RETRY_BACKOFF_CAP = float(os.environ.get("ANALYZER_RETRY_CAP", "30"))
+# Минимальный интервал между СТАРТАМИ запросов к провайдеру, сек («не бомбить»).
+# При 6 воркерах и 0.4с запросы стартуют не чаще ~2.5/сек, а не пачкой разом.
+MIN_REQUEST_INTERVAL = float(os.environ.get("ANALYZER_MIN_INTERVAL", "0.4"))
 
 log = logging.getLogger("analyzer")
 if not log.handlers:
@@ -121,12 +144,12 @@ APPLICATION_PROMPT = """Перед тобой ЗАЯВЛЕНИЕ студент�
   "course_year": "курс, цифра как строка, например '3'",
   "phone": "телефон как написан",
   "application_date": "дата заявления, например '04.05.2026'",
-  "disciplines": ["дисциплина 1", "дисциплина 2"]
+  "disciplines": ["дисциплина 1", "дисциплина 2", "... все дисциплины из списка"]
 }
 
 Правила:
 - ФИО в этой форме написано после слова "ФИО" (может занимать несколько строк) — внимательно прочитай рукописный текст. Имя из заявления является приоритетным. Если буквы абсолютно не ясны — оставь пустую строку.
-- Дисциплины — пронумерованный список (1-5) после фразы "Прошу Вас признать результаты неформального обучения, по дисциплинам:". Распознай каждую написанную строку. Опечатки рукописного текста исправляй на корректные академические названия (например "Обектно ориентрованное программирование" -> "Объектно-ориентированное программирование", если написано неразборчиво похоже на "Программные средства информационных систем" -> "Графические средства информационных систем", "Композиционное моделирование вычислительных систем" -> "Компьютерное моделирование вычислительных систем").
+- Дисциплины — это пронумерованный рукописный список после фразы "Прошу Вас признать результаты неформального обучения, по дисциплинам:". Пунктов может быть СКОЛЬКО УГОДНО (часто 5, но бывает 7, 10 и больше). ОБЯЗАТЕЛЬНО прочитай и верни КАЖДЫЙ пронумерованный пункт до конца списка — не останавливайся на 5, не обрезай список. Сколько строк с номерами заполнено рукой — столько элементов и должно быть в массиве "disciplines" (по одному на каждый номер). Пустые/незаполненные номера пропускай. Опечатки рукописного текста исправляй на корректные академические названия (например "Обектно ориентрованное программирование" -> "Объектно-ориентированное программирование", если написано неразборчиво похоже на "Программные средства информационных систем" -> "Графические средства информационных систем", "Композиционное моделирование вычислительных систем" -> "Компьютерное моделирование вычислительных систем").
 - Если поле не разобрать — оставь пустую строку. НЕ ВЫДУМЫВАЙ.
 - Никаких комментариев и markdown — только JSON."""
 
@@ -235,7 +258,7 @@ class GeminiProvider:
                 config=genai_types.GenerateContentConfig(
                     response_mime_type="application/json",
                     temperature=0.1,
-                    max_output_tokens=2000,
+                    max_output_tokens=4000,
                 ),
             )
             return _extract_json(response.text or "")
@@ -457,6 +480,34 @@ def _build_providers(
     return available
 
 
+class _RateLimiter:
+    """Разносит старты запросов во времени, чтобы не бомбить провайдера пачкой.
+
+    Каждый поток резервирует «слот», отстоящий от предыдущего минимум на
+    min_interval секунд, и спит до него — лок при этом не держится во время сна,
+    поэтому воркеры не блокируют друг друга, а лишь равномерно распределяются.
+    """
+
+    def __init__(self, min_interval: float):
+        self.min_interval = max(0.0, min_interval)
+        self._lock = threading.Lock()
+        self._next_at = 0.0
+
+    def wait(self) -> None:
+        if self.min_interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next_at)
+            self._next_at = slot + self.min_interval
+        delay = slot - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+
+
+_rate_limiter = _RateLimiter(MIN_REQUEST_INTERVAL)
+
+
 def _call_with_failover(
     providers: list[VisionProvider],
     prompt: str,
@@ -471,7 +522,11 @@ def _call_with_failover(
     for p in providers:
         if not p.is_available():
             continue
-        for attempt in range(MAX_RETRIES + 1):
+        attempt = 0              # счётчик попыток (для размера бэкоффа и логов)
+        empty_attempts = 0       # пустые ответы (require_nonempty) — ограничены MAX_RETRIES
+        transient_waited = 0.0   # суммарное время сна на транзиентных ошибках, сек
+        while True:
+            _rate_limiter.wait()  # троттлинг: разносим старты запросов, «не бомбить»
             t0 = time.time()
             try:
                 data = p.analyze(prompt, png_bytes)
@@ -484,42 +539,54 @@ def _call_with_failover(
                         label, p.name, attempt + 1, require_nonempty, elapsed,
                     )
                     last_data = data
+                    empty_attempts += 1
+                    if empty_attempts > MAX_RETRIES:
+                        break  # модель устойчиво отдаёт пустой результат — к следующему провайдеру
+                    attempt += 1
                     time.sleep(1.0)
                     continue
                 log.info("%s [%s] OK in %.1fs (attempt %d)",
                          label, p.name, elapsed, attempt + 1)
                 return data
             except QuotaError as e:
+                # Постоянная ошибка (дневной лимит / неверный ключ) — не ждём, идём дальше
                 log.warning("%s [%s]: quota exhausted: %s", label, p.name, e)
                 last_err = e
-                break  # переходим к следующему провайдеру
-            except TransientError as e:
+                break
+            except Exception as e:
+                # TransientError (503/429/сеть) либо непредвиденное (SSL, разрыв, сбой SDK)
+                # трактуем как временное и даём шанс ретраю.
                 elapsed = time.time() - t0
                 msg = str(e)
-                delay = 1.0 + attempt * 2.0
+                is_transient = isinstance(e, TransientError)
+                base = 1.0 if is_transient else 2.0
+                delay = min(RETRY_BACKOFF_CAP, base + attempt * 2.0)
                 m = re.search(r"retry in (\d+(?:\.\d+)?)\s*s", msg, re.IGNORECASE)
                 if m:
-                    delay = min(30.0, float(m.group(1)) + 0.5)
-                log.warning(
-                    "%s [%s] attempt %d failed in %.1fs (sleeping %.1fs): %s",
-                    label, p.name, attempt + 1, elapsed, delay, msg[:200],
-                )
+                    delay = min(RETRY_BACKOFF_CAP, float(m.group(1)) + 0.5)
+                # Джиттер: разбиваем синхронность ретраев параллельных воркеров,
+                # чтобы они не долбили провайдер одновременно (thundering herd).
+                delay *= random.uniform(0.7, 1.3)
                 last_err = e
-                if attempt < MAX_RETRIES:
-                    time.sleep(delay)
-            except Exception as e:
-                # Любое непредвиденное исключение трактуем как транзиентное
-                # (SSL, разрыв соединения, временные сбои SDK), даём шанс ретраю
-                elapsed = time.time() - t0
-                msg = str(e)
-                delay = 2.0 + attempt * 2.0
+                # Ждём «до победного», если включён режим ожидания и не превышен общий
+                # таймаут на страницу; иначе — обычный лимит MAX_RETRIES.
+                keep_waiting = (
+                    WAIT_FOR_TRANSIENT and transient_waited + delay <= MAX_WAIT_SECONDS
+                ) or attempt < MAX_RETRIES
+                if not keep_waiting:
+                    log.warning(
+                        "%s [%s] attempt %d failed in %.1fs, giving up after %.0fs: %s",
+                        label, p.name, attempt + 1, elapsed, transient_waited, msg[:200],
+                    )
+                    break
                 log.warning(
-                    "%s [%s] attempt %d unexpected error in %.1fs (sleeping %.1fs): %s",
-                    label, p.name, attempt + 1, elapsed, delay, msg[:200],
+                    "%s [%s] attempt %d failed in %.1fs (sleeping %.1fs, waited %.0f/%.0fs): %s",
+                    label, p.name, attempt + 1, elapsed, delay,
+                    transient_waited, MAX_WAIT_SECONDS, msg[:200],
                 )
-                last_err = e
-                if attempt < MAX_RETRIES:
-                    time.sleep(delay)
+                time.sleep(delay)
+                transient_waited += delay
+                attempt += 1
     if last_data is not None:
         log.warning("%s: returning best-effort partial data", label)
         return last_data

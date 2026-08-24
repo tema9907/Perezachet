@@ -15,9 +15,29 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+def _load_env_file() -> None:
+    """Читает .env и прописывает переменные в os.environ (без перезаписи уже заданных)."""
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.is_file():
+        return
+    try:
+        for line in env_path.read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception:
+        pass
+
+_load_env_file()
+
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path(__file__).parent / ".env", override=True)
+    load_dotenv(Path(__file__).parent / ".env", override=False)
 except ImportError:
     pass
 

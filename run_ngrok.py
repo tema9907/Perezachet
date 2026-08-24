@@ -120,8 +120,10 @@ def main():
     cmd = [python_exe, "-m", "uvicorn", "app:app",
            "--host", "127.0.0.1", "--port", str(port), "--log-level", "info"]
     print(f"Запускаю: {' '.join(cmd)}\n")
+    # Передаём переменные из .env в дочерний процесс
+    child_env = {**os.environ, **file_env}
     try:
-        subprocess.run(cmd, cwd=base_dir)
+        subprocess.run(cmd, cwd=base_dir, env=child_env)
     except KeyboardInterrupt:
         pass
     finally:
