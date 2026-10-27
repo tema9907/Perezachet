@@ -51,6 +51,10 @@ from pydantic import BaseModel, Field
 import analyzer
 import application_generator
 import doc_generator
+import formal_analyzer
+import formal_doc_generator
+import ku_plans
+from formal_store import FormalStore
 from intake_store import IntakeStore
 from queue_store import QueueStore
 from syslog import log
@@ -68,6 +72,11 @@ CONCLUSIONS_DIR = DATA_DIR / "conclusions"
 APPLICATIONS_DIR = DATA_DIR / "applications"
 CONCLUSIONS_DIR.mkdir(parents=True, exist_ok=True)
 APPLICATIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Модуль формального перезачёта (транскрипт из другого вуза → заключение + протокол)
+FORMAL_STORE = FormalStore(DATA_DIR / "formal.sqlite3")
+FORMAL_DIR = DATA_DIR / "formal"
+FORMAL_DIR.mkdir(parents=True, exist_ok=True)
 
 # In-memory job store for async PDF analysis
 _analyze_jobs: dict[str, dict] = {}
@@ -1397,6 +1406,523 @@ async def admin_delete_queue(request_id: int, _: str = Depends(_require_admin)):
     return {"ok": True}
 
 
+# ===========================================================================
+# Модуль формального перезачёта (formal education recognition)
+# ===========================================================================
+class FormalPlanRequest(BaseModel):
+    faculty: str = ku_plans.DEFAULT_FACULTY
+    speciality: str = ""
+    stream_id: str = ""         # id потока (ручной режим); пусто/0 = авто по году
+    stream_label: str = ""      # метка потока (для отображения/кеша)
+    courses: list[int] = Field(default_factory=lambda: [1])
+    label: str = ""             # человекочитаемое имя программы (для кеша)
+    pasted_text: str = ""       # если задан — парсим вставленный вручную план
+    refresh: bool = False       # игнорировать кеш
+
+
+class FormalEditState(BaseModel):
+    student: dict[str, Any] = Field(default_factory=dict)
+    target: dict[str, Any] = Field(default_factory=dict)
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+
+def _grade_str(pts: str, letter: str) -> str:
+    pts = (pts or "").strip()
+    letter = (letter or "").strip()
+    if pts and letter:
+        return f"{pts}({letter})"
+    return pts or letter
+
+
+def _facts_summary(facts: list[dict[str, Any]]) -> tuple[str, str, str]:
+    """Перезачитываемые предметы → три колонки документа (по строке на предмет).
+
+    Объём факта — в ЧАСАХ (в плане СКУ он в кредитах, в транскриптах колледжей в часах;
+    колонка документа так и называется «Количество кредитов (часов)»).
+    _set_cell_text рендерит '\\n' как перенос внутри ячейки, поэтому названия,
+    объём и баллы остаются построчно выровненными друг с другом.
+    """
+    names = "\n".join(str(f.get("name", "") or "") for f in facts)
+    hours = "\n".join(
+        (str(f.get("hours", "") or "") + " ч." if str(f.get("hours", "") or "").strip() else "")
+        for f in facts
+    )
+    grades = "\n".join(str(f.get("grade", "") or "") for f in facts)
+    return names, hours, grades
+
+
+def _volume_check(plan_credits: Any, facts: list[dict[str, Any]]) -> tuple[float | None, float]:
+    """Требуемые часы по плану и набранные часы фактов.
+
+    Требуемые = кредиты плана × 15. Если кредитов или часов нет — сравнивать нечего.
+    Результат используется только для оценки соответствия; в «Примечание» ничего
+    не пишем — это поле эксперта.
+    """
+    required = formal_analyzer.credits_to_hours(plan_credits)
+    got = sum(formal_analyzer.to_number(f.get("hours")) or 0.0 for f in facts)
+    return required, got
+
+
+def _adjust_compliance(compliance: str, required: float | None, got: float) -> str:
+    """Понижает «полное» до «частичного», если объём в часах не дотягивает до плана.
+
+    Только понижаем: содержательную оценку даёт модель, а нехватка часов —
+    объективная причина не считать перезачёт полным. Повышать нельзя.
+    """
+    if compliance != "полное" or required is None or not got:
+        return compliance
+    return "полное" if got >= required else "частичное"
+
+
+def _final_grade_from_facts(facts: list[dict[str, Any]]) -> str:
+    """Зачтённая оценка при нескольких предметах — по самому весомому (макс. кредитов).
+
+    Эксперт правит вручную; автоматика лишь предлагает разумное значение.
+    """
+    graded = [f for f in facts if str(f.get("grade", "") or "").strip()]
+    if not graded:
+        return ""
+
+    def _cr(f: dict[str, Any]) -> float:
+        try:
+            return float(str(f.get("credits", "") or "0").replace(",", ".") or 0)
+        except ValueError:
+            return 0.0
+
+    return str(max(graded, key=_cr).get("grade", ""))
+
+
+def _build_formal_rows(
+    plan: list[dict[str, Any]],
+    transcript: list[dict[str, Any]],
+    matches: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Собирает редактируемые строки таблицы: план × транскрипт по матчингу.
+
+    Одной дисциплине плана может соответствовать НЕСКОЛЬКО дисциплин транскрипта —
+    они лежат в row['facts'], а fact_name/fact_credits/fact_grade — их плоское
+    представление для документов и для совместимости со старыми заявлениями.
+    """
+    by_plan: dict[int, dict[str, Any]] = {}
+    for m in matches or []:
+        try:
+            by_plan[int(m.get("plan_index"))] = m
+        except (TypeError, ValueError):
+            continue
+    rows: list[dict[str, Any]] = []
+    for i, p in enumerate(plan):
+        m = by_plan.get(i)
+        facts: list[dict[str, Any]] = []
+        for ti in (formal_analyzer._match_indexes(m) if m else []):
+            if not 0 <= ti < len(transcript):
+                continue
+            t = transcript[ti]
+            facts.append({
+                "name": t.get("name", ""),
+                "hours": str(t.get("hours", "") or ""),
+                "grade": _grade_str(t.get("grade_points", ""), t.get("grade_letter", "")),
+            })
+        plan_credits = str(p.get("credits", "") or "")
+        names, hours, grades = _facts_summary(facts)
+        required, got = _volume_check(plan_credits, facts)
+        compliance = (m.get("compliance", "полное") if m else "") if facts else ""
+        compliance = _adjust_compliance(compliance, required, got)
+        # «не соответствует» — дисциплина НЕ зачтена, она уходит в академразницу,
+        # даже если у подобранного предмета была хорошая оценка
+        final = "АР" if (not facts or compliance == "не соответствует") \
+            else _final_grade_from_facts(facts)
+        rows.append({
+            "plan_name": p.get("name", ""),
+            "plan_credits": plan_credits,
+            "facts": facts,
+            "fact_name": names,
+            "fact_credits": hours,
+            "fact_grade": grades,
+            "compliance": compliance,
+            "note": "",          # заполняет эксперт вручную
+            "final_grade": final,
+        })
+    return rows
+
+
+async def _analyze_formal_bg(app_id: int, pdf_bytes: bytes) -> None:
+    """Фоновая задача: распознать транскрипт и сопоставить с уже загруженным планом."""
+    loop = asyncio.get_event_loop()
+    try:
+        gemini_key, openrouter_key = _env_llm_keys()
+        if not (gemini_key or openrouter_key):
+            raise RuntimeError("Не задан GEMINI_API_KEY или OPENROUTER_API_KEY")
+        rec = FORMAL_STORE.get(app_id)
+        plan = (rec.plan_json or {}).get("disciplines") or []
+
+        analysis = await loop.run_in_executor(
+            None,
+            lambda: formal_analyzer.analyze_formal_pdf(
+                pdf_bytes, gemini_key=gemini_key, openrouter_key=openrouter_key),
+        )
+        FORMAL_STORE.save_analyze(app_id, analysis)
+        transcript = analysis.get("transcript") or []
+
+        matches: list[dict[str, Any]] = []
+        if plan and transcript:
+            try:
+                matches = await loop.run_in_executor(
+                    None,
+                    lambda: formal_analyzer.match_plan_to_transcript(
+                        plan, transcript, gemini_key=gemini_key, openrouter_key=openrouter_key),
+                )
+            except Exception as e:
+                log(f"formal #{app_id}: матчинг не удался — {e}")
+
+        rows = _build_formal_rows(plan, transcript, matches)
+        edit = {
+            "student": {
+                "name": analysis.get("student_name", ""),
+                "source_institution": analysis.get("source_institution", ""),
+                "source_program": analysis.get("source_program", ""),
+            },
+            "target": {
+                "program": rec.target_program, "faculty": rec.target_faculty,
+                "speciality": rec.target_speciality, "stream": rec.target_stream,
+                "course": rec.target_course, "year": rec.target_year, "group": rec.target_group,
+            },
+            "rows": rows,
+            "meta": {
+                "protocol_number": "", "protocol_date": "", "group": rec.target_group,
+                "enroll_semester": "", "academic_difference": "",
+            },
+        }
+        FORMAL_STORE.save_edit(app_id, edit, edit["meta"])
+        FORMAL_STORE.set_status(app_id, "pending_approval")
+        log(f"formal #{app_id}: анализ завершён, строк={len(rows)}")
+    except Exception as e:
+        log(f"formal #{app_id}: ошибка анализа — {e}\n{traceback.format_exc()[:500]}")
+        try:
+            FORMAL_STORE.set_status(app_id, "error", str(e))
+        except Exception:
+            pass
+
+
+@app.get("/formal")
+async def formal_page():
+    return FileResponse(str(STATIC_DIR / "formal.html"))
+
+
+@app.get("/api/formal/selects")
+async def formal_selects(faculty: str = ku_plans.DEFAULT_FACULTY):
+    """Справочники специальность/поток/курс/год с сайта вуза."""
+    try:
+        sel = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: ku_plans.fetch_selects(faculty))
+        return {"ok": True, "faculty": faculty, **sel}
+    except ku_plans.KuError as e:
+        return JSONResponse(status_code=502, content={"ok": False, "error": str(e)})
+
+
+def _obtain_plan(*, faculty: str, speciality: str, courses: list[int],
+                 stream_id: str = "", stream_label: str = "", label: str = "",
+                 refresh: bool = False) -> dict:
+    """Достаёт план: кеш → сайт (курс-фильтр). Кладёт в кеш. Бросает ku_plans.KuError."""
+    ck = ku_plans.cache_key(faculty=faculty, speciality=speciality, courses=courses,
+                            stream_id=stream_id, stream_label=stream_label,
+                            year=ku_plans.DEFAULT_YEAR)
+    if not refresh:
+        cached = FORMAL_STORE.cache_get(ck)
+        if cached and cached.get("disciplines"):
+            return {"status": "ok", "source": "cache",
+                    "disciplines": cached["disciplines"],
+                    "stream": cached.get("stream", stream_label)}
+    res = ku_plans.fetch_plan(faculty=faculty, speciality=speciality, courses=courses,
+                              stream_id=stream_id, stream_label=stream_label)
+    if res["status"] == "ok" and res["disciplines"]:
+        FORMAL_STORE.cache_put(ck, label or ck,
+                               {"disciplines": res["disciplines"],
+                                "stream": res.get("stream", "")})
+        res["source"] = "site"
+    return res
+
+
+@app.post("/api/formal/plan")
+async def formal_plan(req: FormalPlanRequest):
+    """Получить учебный план: вставленный вручную ИЛИ автоподгрузка с сайта (+кеш).
+
+    Используется для предпросмотра и для докидывания дисциплин другого курса.
+    """
+    gemini_key, openrouter_key = _env_llm_keys()
+    loop = asyncio.get_event_loop()
+
+    if req.pasted_text.strip():
+        try:
+            disciplines = await loop.run_in_executor(
+                None,
+                lambda: formal_analyzer.parse_pasted_plan(
+                    req.pasted_text, gemini_key=gemini_key, openrouter_key=openrouter_key),
+            )
+            return {"ok": True, "source": "pasted", "status": "ok", "disciplines": disciplines}
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+    if not req.speciality:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "Не выбрана специальность."})
+    try:
+        res = await loop.run_in_executor(
+            None,
+            lambda: _obtain_plan(faculty=req.faculty, speciality=req.speciality,
+                                 courses=req.courses or [1], stream_id=req.stream_id,
+                                 stream_label=req.stream_label,
+                                 label=req.label, refresh=req.refresh),
+        )
+    except ku_plans.KuError as e:
+        return JSONResponse(status_code=502, content={
+            "ok": False, "status": "server_error", "disciplines": [],
+            "error": str(e), "message": "Сайт вуза недоступен. Вставьте план вручную."})
+    return {"ok": True, **res}
+
+
+@app.post("/api/formal/analyze")
+async def formal_analyze(
+    file: UploadFile = File(...),
+    target: str = Form("{}"),
+    plan: str = Form("{}"),
+):
+    """Максимально автоматизированный вход: PDF + целевая специальность.
+
+    План подтягивается с сайта САМ (если не передан явно). Если сайт недоступен —
+    возвращаем need_paste, чтобы UI предложил вставить план и повторить.
+    """
+    try:
+        tgt = json.loads(target or "{}")
+        pln = json.loads(plan or "{}")
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="bad target/plan json")
+
+    pdf_bytes = await file.read()
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="Пустой файл")
+
+    loop = asyncio.get_event_loop()
+    disciplines = pln.get("disciplines") or []
+    plan_source = "provided"
+    resolved_stream = tgt.get("stream_label", "")
+    courses = [int(c) for c in (tgt.get("courses") or [1]) if str(c).isdigit()] or [1]
+
+    if not disciplines:
+        speciality = tgt.get("speciality", "")
+        if not speciality:
+            return JSONResponse(status_code=200, content={
+                "ok": False, "need_paste": True,
+                "message": "Не выбрана специальность и не передан план."})
+        try:
+            res = await loop.run_in_executor(
+                None,
+                lambda: _obtain_plan(
+                    faculty=tgt.get("faculty", ku_plans.DEFAULT_FACULTY),
+                    speciality=speciality, courses=courses,
+                    stream_id=tgt.get("stream_id", ""),
+                    stream_label=tgt.get("stream_label", ""),
+                    label=tgt.get("program", "")),
+            )
+        except ku_plans.KuError as e:
+            return JSONResponse(status_code=200, content={
+                "ok": False, "need_paste": True,
+                "message": f"Сайт вуза недоступен: {e}. Вставьте план вручную."})
+        if res["status"] != "ok" or not res["disciplines"]:
+            return JSONResponse(status_code=200, content={
+                "ok": False, "need_paste": True,
+                "message": res.get("message") or "План не получен. Вставьте вручную."})
+        disciplines = res["disciplines"]
+        plan_source = res.get("source", "site")
+        resolved_stream = res.get("stream", "") or resolved_stream
+
+    app_rec = FORMAL_STORE.create(
+        student_name="", status="analyzing",
+        target_program=tgt.get("program", ""), target_faculty=tgt.get("faculty", ""),
+        target_speciality=tgt.get("speciality", ""),
+        target_stream=resolved_stream,
+        # «1» для одного курса, «1-2» / «1-3» — когда план собран за несколько курсов
+        target_course=(str(courses[0]) if len(courses) == 1
+                       else f"{min(courses)}-{max(courses)}"),
+    )
+    tgt_upd = {"target_group": tgt["group"]} if tgt.get("group") else None
+    FORMAL_STORE.save_plan(app_rec.id, {"disciplines": disciplines}, target=tgt_upd)
+
+    pdf_path = FORMAL_DIR / f"{app_rec.id}_source.pdf"
+    pdf_path.write_bytes(pdf_bytes)
+    FORMAL_STORE._update(app_rec.id, {"pdf_path": str(pdf_path)})
+
+    asyncio.create_task(_analyze_formal_bg(app_rec.id, pdf_bytes))
+    log(f"API /formal/analyze: #{app_rec.id} принято, план={plan_source} "
+        f"поток='{resolved_stream}' ({len(disciplines)} дисц.), анализ запущен")
+    return {"ok": True, "id": app_rec.id, "plan_source": plan_source,
+            "plan_count": len(disciplines), "stream": resolved_stream}
+
+
+def _formal_to_dict(a) -> dict:
+    return {
+        "id": a.id, "student_name": a.student_name, "status": a.status,
+        "target_program": a.target_program, "target_group": a.target_group,
+        "source_institution": a.source_institution, "source_program": a.source_program,
+        "edit": a.edit_json, "plan": a.plan_json, "analyze": a.analyze_json,
+        "meta": a.meta_json,
+        "has_conclusion": bool(a.conclusion_path), "has_protocol": bool(a.protocol_path),
+        "error": a.error or "", "created_at": a.created_at, "updated_at": a.updated_at,
+    }
+
+
+@app.get("/api/formal/applications")
+async def formal_list():
+    return {"items": [
+        {"id": a.id, "student_name": a.student_name, "status": a.status,
+         "target_program": a.target_program, "source_program": a.source_program,
+         "created_at": a.created_at, "updated_at": a.updated_at, "error": a.error or ""}
+        for a in FORMAL_STORE.list()
+    ]}
+
+
+@app.get("/api/formal/applications/{app_id}")
+async def formal_get(app_id: int):
+    try:
+        return _formal_to_dict(FORMAL_STORE.get(app_id))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="not found")
+
+
+@app.post("/api/formal/applications/{app_id}/edit")
+async def formal_save_edit(app_id: int, payload: FormalEditState):
+    try:
+        FORMAL_STORE.get(app_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="not found")
+    edit = {"student": payload.student, "target": payload.target, "rows": payload.rows,
+            "meta": payload.meta}
+    FORMAL_STORE.save_edit(app_id, edit, payload.meta)
+    return {"ok": True}
+
+
+def _payload_from_edit(a) -> "formal_doc_generator.FormalPayload":
+    edit = a.edit_json or {}
+    student = edit.get("student") or {}
+    target = edit.get("target") or {}
+    meta = edit.get("meta") or a.meta_json or {}
+    rows = []
+    for r in (edit.get("rows") or []):
+        facts = r.get("facts")
+        if isinstance(facts, list) and facts:
+            # список предметов — источник истины; плоские поля пересобираем из него
+            names, credits, grades = _facts_summary(facts)
+        else:
+            names = r.get("fact_name", "")
+            credits = str(r.get("fact_credits", ""))
+            grades = r.get("fact_grade", "")
+        rows.append(formal_doc_generator.FormalRow(
+            plan_name=r.get("plan_name", ""), plan_credits=str(r.get("plan_credits", "")),
+            fact_name=names, fact_credits=credits, fact_grade=grades,
+            compliance=r.get("compliance", ""),
+            note=r.get("note", ""), final_grade=r.get("final_grade", ""),
+        ))
+    p = formal_doc_generator.FormalPayload(
+        student_name=student.get("name", "") or a.student_name,
+        target_program=target.get("program", "") or a.target_program,
+        course=str(target.get("course", "") or a.target_course),
+        source_institution=student.get("source_institution", "") or a.source_institution,
+        source_program=student.get("source_program", "") or a.source_program,
+        rows=rows,
+        protocol_number=str(meta.get("protocol_number", "")),
+        protocol_date=str(meta.get("protocol_date", "")),
+        group=str(meta.get("group", "") or target.get("group", "") or a.target_group),
+        enroll_semester=str(meta.get("enroll_semester", "")),
+        academic_difference=str(meta.get("academic_difference", "")),
+    )
+    # опциональное переопределение состава комиссии
+    if meta.get("chair"):
+        p.chair = meta["chair"]
+    if meta.get("deputy"):
+        p.deputy = meta["deputy"]
+    if isinstance(meta.get("members"), list) and meta["members"]:
+        p.members = meta["members"]
+    if meta.get("secretary"):
+        p.secretary = meta["secretary"]
+    if meta.get("reporter"):
+        p.reporter = meta["reporter"]
+    if isinstance(meta.get("kafedras"), list) and meta["kafedras"]:
+        p.kafedras = [
+            formal_doc_generator.Kafedra(k.get("name", ""), k.get("experts", []) or ["", "", ""])
+            for k in meta["kafedras"]
+        ]
+    return p
+
+
+@app.post("/api/formal/applications/{app_id}/generate")
+async def formal_generate(app_id: int):
+    try:
+        a = FORMAL_STORE.get(app_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        payload = _payload_from_edit(a)
+        safe = re.sub(r"[^\w\-]+", "_", payload.student_name) or f"formal_{a.id}"
+        concl = formal_doc_generator.build_conclusion(payload)
+        proto = formal_doc_generator.build_protocol(payload)
+        concl_path = FORMAL_DIR / f"Заключение_{safe}.docx"
+        proto_path = FORMAL_DIR / f"Протокол_{safe}.docx"
+        concl_path.write_bytes(concl)
+        proto_path.write_bytes(proto)
+        FORMAL_STORE.set_outputs(a.id, conclusion_path=str(concl_path), protocol_path=str(proto_path))
+        log(f"API /formal/{app_id}/generate: документы созданы")
+        return {"ok": True, "conclusion": concl_path.name, "protocol": proto_path.name}
+    except Exception as e:
+        log(f"API /formal/{app_id}/generate: ошибка — {e}\n{traceback.format_exc()[:400]}")
+        FORMAL_STORE.set_status(a.id, "error", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/formal/applications/{app_id}/conclusion")
+async def formal_download_conclusion(app_id: int):
+    try:
+        a = FORMAL_STORE.get(app_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="not found")
+    if not a.conclusion_path or not Path(a.conclusion_path).is_file():
+        raise HTTPException(status_code=404, detail="Заключение не сгенерировано")
+    return FileResponse(a.conclusion_path, filename=Path(a.conclusion_path).name,
+                        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+
+@app.get("/api/formal/applications/{app_id}/protocol")
+async def formal_download_protocol(app_id: int):
+    try:
+        a = FORMAL_STORE.get(app_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="not found")
+    if not a.protocol_path or not Path(a.protocol_path).is_file():
+        raise HTTPException(status_code=404, detail="Протокол не сгенерирован")
+    return FileResponse(a.protocol_path, filename=Path(a.protocol_path).name,
+                        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+
+@app.get("/api/formal/applications/{app_id}/pdf")
+async def formal_view_pdf(app_id: int):
+    try:
+        a = FORMAL_STORE.get(app_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="not found")
+    if not a.pdf_path or not Path(a.pdf_path).is_file():
+        raise HTTPException(status_code=404, detail="PDF не найден")
+    return FileResponse(a.pdf_path, media_type="application/pdf")
+
+
+@app.delete("/api/formal/applications/{app_id}")
+async def formal_delete(app_id: int):
+    try:
+        FORMAL_STORE.get(app_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="not found")
+    FORMAL_STORE.delete(app_id)
+    return {"ok": True}
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     log("========== Старт приложения ==========")
@@ -1404,3 +1930,4 @@ async def _startup() -> None:
         f"Конфиг: GEMINI_KEY={'✓' if os.environ.get('GEMINI_API_KEY') else '—'}, "
         f"OPENROUTER_KEY={'✓' if os.environ.get('OPENROUTER_API_KEY') else '—'}"
     )
+    FORMAL_STORE.cache_purge_stale(f"v{ku_plans.PLAN_PARSER_VERSION}|")

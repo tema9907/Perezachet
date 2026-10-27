@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="ru">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Формальный перезачёт — NefrLearn</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link id="favicon" rel="icon" type="image/x-icon" href="/static/favicon.ico">
+  <script src="/static/theme.js"></script>
+  <style>
+    .fgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+    .plan-row { display: grid; grid-template-columns: 1fr 90px 32px; gap: 6px; align-items: center; margin-bottom: 6px; }
+    .ftable { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+    .ftable th, .ftable td { border: 1px solid var(--border); padding: 4px 6px; vertical-align: top; }
+    .ftable th { background: var(--primary-soft); color: var(--text); font-weight: 600; text-align: center; font-size: 12px; }
+    .ftable td input, .ftable td select, .ftable td textarea {
+      width: 100%; border: 1px solid transparent; background: transparent; font: inherit;
+      color: var(--text); padding: 2px 3px; border-radius: 4px; box-sizing: border-box;
+    }
+    .ftable td input:focus, .ftable td select:focus, .ftable td textarea:focus {
+      border-color: var(--primary); background: var(--surface); outline: none;
+    }
+    .ftable td.num { text-align: center; width: 34px; color: var(--muted); }
+    /* «Фактически изучено»: несколько перезачитываемых предметов на одну дисциплину плана.
+       Три колонки рисуют по одной строке на предмет — фиксированная высота держит их в ряд. */
+    .fact-line { display: flex; align-items: center; gap: 2px; height: 24px; margin-bottom: 3px; }
+    .fact-line > input { height: 22px; flex: 1 1 auto; min-width: 0; }
+    .fact-add { width: 100%; font-size: 11px; margin-top: 2px; opacity: .8; }
+    .fact-rm { cursor: pointer; color: var(--danger); border: none; background: none;
+      font-size: 14px; line-height: 1; padding: 0 2px; flex: 0 0 auto; }
+    .fact-empty { color: var(--muted); font-size: 12px; height: 24px; line-height: 24px; }
+    /* Нераспознанная оценка — эксперт обязан вписать её вручную, поэтому подсвечиваем
+       и саму строку таблицы, и конкретное пустое поле. */
+    .ftable tr.nogr { background: rgba(245, 158, 11, 0.10); }
+    .ftable td input.no-grade { background: #fef9c3; border-color: #f59e0b; color: #854d0e; }
+    .ftable td input.no-grade::placeholder { color: #a16207; }
+    .nogr-mark { background: #fef9c3; color: #854d0e; border-radius: 3px; padding: 0 4px; }
+    #poolMeta { font-weight: 400; font-size: 12px; color: var(--muted); }
+    .ftable tr.ar { background: rgba(239, 68, 68, 0.06); }
+    .ftable textarea { resize: vertical; min-height: 26px; }
+    .tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 10px; }
+    .tag.ok { background: #dcfce7; color: #166534; }
+    .tag.ar { background: #fee2e2; color: #991b1b; }
+    .tag.wait { background: #fef9c3; color: #854d0e; }
+    .muted-note, .subtle { color: var(--muted); font-size: 13px; }
+    .subtle { font-size: 12px; }
+    .plan-pool { font-size: 12px; color: var(--muted); }
+    .row-del { cursor: pointer; color: var(--danger); border: none; background: none; font-size: 16px; }
+    .flist-item { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px;
+      border: 1px solid var(--border); border-radius: 8px; margin-bottom: 6px; cursor: pointer; }
+    .flist-item:hover { border-color: var(--primary); }
+    .hidden { display: none !important; }
+    .inline-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    details.plan-details summary { cursor: pointer; font-weight: 600; margin-bottom: 8px; }
+  </style>
+</head>
+
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">
+      <span class="logo">ЭЗ</span>
+      <span class="brand-name">NefrLearn</span>
+    </a>
+    <nav class="main-nav">
+      <a href="/" class="nav-link">Генератор</a>
+      <a href="/formal" class="nav-link active">Формальный перезачёт</a>
+      <a href="/intake" class="nav-link">Приём заявлений</a>
+      <a href="/applications" class="nav-link">Заявления</a>
+      <a href="/approve" class="nav-link">Экспертная очередь</a>
+      <a href="/conclusions" class="nav-link">Заключения</a>
+    </nav>
+    <div class="topbar-end">
+      <button id="themeToggle" class="nav-theme-toggle" onclick="__toggleTheme()" title="Тёмная тема">🌙</button>
+      <a href="/admin" class="nav-admin" title="Adminка">⚙</a>
+    </div>
+  </header>
+
+  <main>
+    <!-- Step 1: PDF + target speciality -->
+    <section id="step-input" class="card">
+      <div class="step-head"><span class="step-num">1</span>
+        <h2>Заявление + транскрипт и целевая программа</h2></div>
+
+      <label class="dropzone" id="dropzone">
+        <input type="file" id="pdfInput" accept="application/pdf" hidden>
+        <div class="dz-inner">
+          <svg viewBox="0 0 24 24" width="44" height="44" aria-hidden="true">
+            <path fill="currentColor" d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6z" /></svg>
+          <p><strong>Кликните</strong> или перетащите PDF сюда</p>
+          <p class="dz-hint">Первая страница — заявление, далее — транскрипт(ы)</p>
+        </div>
+      </label>
+      <div class="actions"><span id="uploadMeta" class="meta"></span></div>
+
+      <div class="fgrid" style="margin-top:10px">
+        <div class="field"><label>Специальность (целевая)</label><select id="selSpeciality"></select></div>
+        <div class="field"><label>Годы обучения (какие курсы плана брать)</label>
+          <select id="selCourses">
+            <option value="auto" selected>Авто — 1 курс</option>
+            <option value="1,2">1 и 2 курс</option>
+            <option value="1,2,3">1, 2 и 3 курс</option>
+          </select></div>
+        <div class="field"><label>Группа зачисления</label><input id="fGroup" placeholder="ИС-у-26"></div>
+      </div>
+
+      <div class="field" style="margin-top:8px">
+        <label>Откуда брать учебный план (поток)</label>
+        <div class="inline-actions">
+          <label class="subtle"><input type="radio" name="streamMode" value="auto" checked>
+            Авто — набор прошлого года (<span id="autoStreamHint">-25</span>)</label>
+          <label class="subtle"><input type="radio" name="streamMode" value="manual">
+            Выбрать поток вручную</label>
+          <select id="selStream" class="hidden" style="max-width:240px"></select>
+        </div>
+      </div>
+      <p class="muted-note">Учебный план подтянется автоматически с сайта вуза.
+        По умолчанию берётся <b>первый год обучения</b>; выберите «1 и 2» или «1, 2 и 3 курс»,
+        если студенту нужно перезачесть дисциплины сразу за несколько лет.</p>
+
+      <div class="inline-actions" style="margin-top:8px">
+        <button id="processBtn" class="btn-primary" disabled>Обработать заявление</button>
+        <button id="previewPlanBtn" class="btn-ghost">Предпросмотр плана</button>
+        <button id="refreshSelectsBtn" class="btn-ghost">↻ Справочники</button>
+        <span id="selectsMeta" class="subtle"></span>
+      </div>
+
+      <!-- optional editable plan preview -->
+      <div id="planBox" class="hidden" style="margin-top:14px">
+        <div class="row-head"><h3>Учебный план (<span id="planCount">0</span> дисц.)
+          <span id="planCourses" class="subtle"></span></h3>
+          <button id="addPlanBtn" class="btn-ghost">+ Дисциплина</button></div>
+        <div id="planList"></div>
+        <div class="inline-actions" style="margin-top:8px">
+          <span class="subtle">Добавить дисциплины курса:</span>
+          <select id="appendCourse" style="max-width:80px">
+            <option value="2">2</option><option value="3">3</option><option value="4">4</option></select>
+          <button id="appendPlanBtn" class="btn-ghost">Подгрузить с сайта</button>
+        </div>
+      </div>
+
+      <!-- paste fallback -->
+      <div id="pasteBox" class="hidden" style="margin-top:14px">
+        <div class="field">
+          <label>Сайт вуза недоступен — вставьте учебный план вручную</label>
+          <textarea id="pasteText" rows="6" placeholder="Иностранный язык 10&#10;История Казахстана 5&#10;Математика 5 ..."></textarea>
+        </div>
+        <button id="parsePasteBtn" class="btn-primary">Распознать вставленный план</button>
+      </div>
+    </section>
+
+    <!-- loading -->
+    <section id="step-loading" class="card hidden">
+      <div class="loader"></div>
+      <p id="loadingText">Подтягиваем план, распознаём транскрипт и сопоставляем…</p>
+    </section>
+
+    <!-- Step 2: editor -->
+    <section id="step-editor" class="card hidden">
+      <div class="step-head"><span class="step-num">2</span>
+        <h2>Проверьте и отредактируйте</h2></div>
+
+      <div id="analyzeWarnings" class="hidden"></div>
+
+      <div class="fgrid">
+        <div class="field"><label>ФИО студента</label><input id="eName"></div>
+        <div class="field"><label>Вуз-источник</label><input id="eSrcInst"></div>
+        <div class="field"><label>Программа-источник</label><input id="eSrcProg"></div>
+        <div class="field"><label>Целевая ОП</label><input id="eProgram"></div>
+        <div class="field"><label>Курс</label><input id="eCourse"></div>
+      </div>
+
+      <details class="plan-details" style="margin-top:8px">
+        <summary>Дисциплины транскрипта (справочно) <span id="poolMeta"></span></summary>
+        <div id="transcriptPool" class="plan-pool"></div>
+      </details>
+
+      <div class="row-head" style="margin-top:12px">
+        <h3>Таблица перезачёта <span id="rowsMeta" class="subtle"></span></h3>
+        <button id="addRowBtn" class="btn-ghost">+ Строка</button>
+      </div>
+      <div style="overflow-x:auto">
+        <table class="ftable" id="resTable">
+          <thead>
+            <tr>
+              <th rowspan="2">№</th>
+              <th colspan="2">По учебному плану СКУ</th>
+              <th colspan="3">Фактически изучено (транскрипт)</th>
+              <th colspan="2">Заключение</th>
+              <th rowspan="2">Зачтено</th>
+              <th rowspan="2"></th>
+            </tr>
+            <tr>
+              <th>Дисциплина</th><th>Кред.</th>
+              <th>Дисциплина</th><th>Часы</th><th>Баллы</th>
+              <th>Соответствие</th><th>Примеч.</th>
+            </tr>
+          </thead>
+          <tbody id="resBody"></tbody>
+        </table>
+      </div>
+
+      <div class="step-head" style="margin-top:20px"><span class="step-num">3</span>
+        <h2>Реквизиты протокола</h2></div>
+      <div class="fgrid">
+        <div class="field"><label>№ протокола</label><input id="mNum" placeholder="18"></div>
+        <div class="field"><label>Дата</label><input id="mDate" placeholder="24.08.2026"></div>
+        <div class="field"><label>Группа</label><input id="mGroup" placeholder="ВТиПО-25к"></div>
+        <div class="field"><label>Семестр зачисления</label><input id="mSem" placeholder="3"></div>
+        <div class="field"><label>Академ. разница (кредитов)</label><input id="mDiff" placeholder="авто"></div>
+      </div>
+
+      <div class="actions actions-right" id="editorActions" style="margin-top:16px">
+        <button id="backBtn" class="btn-ghost">← Назад</button>
+        <button id="saveBtn" class="btn-ghost">Сохранить</button>
+        <button id="genBtn" class="btn-primary">Сгенерировать документы</button>
+      </div>
+      <div id="downloads" class="inline-actions hidden" style="margin-top:12px"></div>
+    </section>
+
+    <!-- existing applications -->
+    <section class="card">
+      <div class="row-head"><h3>Заявления на формальный перезачёт</h3>
+        <button id="reloadListBtn" class="btn-ghost">↻</button></div>
+      <div id="flist"><p class="subtle">Загрузка…</p></div>
+    </section>
+
+    <div id="toast" class="toast hidden"></div>
+  </main>
+
+  <script src="/static/formal.js"></script>
+</body>
+
+</html>
