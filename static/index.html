@@ -6,6 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Экспертное заключение — генератор</title>
   <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/tutorial.css">
   <link id="favicon" rel="icon" type="image/x-icon" href="/static/favicon.ico">
   <script src="/static/theme.js"></script>
 </head>
@@ -25,6 +26,10 @@
       <a href="/conclusions" class="nav-link">Заключения</a>
     </nav>
     <div class="topbar-end">
+      <button id="tutorialBtn" class="nav-tutorial" title="Как пользоваться генератором">
+        <span class="nav-tutorial-icon">?</span>
+        <span class="nav-tutorial-label">Туториал</span>
+      </button>
       <button id="themeToggle" class="nav-theme-toggle" onclick="__toggleTheme()" title="Тёмная тема">🌙</button>
       <a href="/admin" class="nav-admin" title="Adminка">⚙</a>
     </div>
@@ -115,6 +120,7 @@
   </main>
 
   <script src="/static/app.js"></script>
+  <script src="/static/tutorial.js"></script>
 </body>
 
 </html>
